@@ -1,0 +1,19 @@
+*.md
+
+# Ignore dataset folders
+datasets/
+
+# Ignore generated data inside ami
+ami/data_final/
+ami/json_dumps/
+ami/json_run*/
+
+# Ignore additional AMI resources
+ami/AMI_samples/
+ami/ami_public_manual_1.6.2/
+
+# Common OS / Python cruft
+.DS_Store
+__pycache__/
+*.pyc
+
