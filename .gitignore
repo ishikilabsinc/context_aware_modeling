@@ -1,4 +1,5 @@
 *.md
+!**/README.md
 
 # Ignore dataset folders
 datasets/
@@ -17,3 +18,9 @@ ami/ami_public_manual_1.6.2/
 __pycache__/
 *.pyc
 
+# Benchmarking and fine-tuning outputs
+data/*
+!data/README.md
+fine_tuning/checkpoints/
+benchmarking/results/
+evaluation/results/
