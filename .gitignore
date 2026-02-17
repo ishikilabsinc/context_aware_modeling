@@ -19,8 +19,7 @@ __pycache__/
 *.pyc
 
 # Benchmarking and fine-tuning outputs
-data/*
-!data/README.md
+data/
 fine_tuning/checkpoints/
 benchmarking/results/
 evaluation/results/

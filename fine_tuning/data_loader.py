@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Data Loader for Fine-Tuning
-
-Loads and preprocesses training data for LoRA fine-tuning.
-Formats samples according to the training format from ami/stage5_format_training.py
+Load and format training/val data for LoRA fine-tuning. Uses config for paths.
 """
 
 import json
@@ -13,7 +10,7 @@ from typing import List, Dict
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
-from config import BASE_MODEL, TRAIN_FILE, VAL_FILE
+from config import TRAIN_FILE, VAL_FILE
 
 
 SYSTEM_PROMPT = """You are a turn-taking decision model for a voice AI agent. Your job is to decide whether the AI agent should START TALKING or STAY SILENT after a detected pause in conversation.
@@ -138,10 +135,12 @@ def _select_context_turns(context_turns: List[Dict], tokenizer, max_tokens: int)
 
 
 class TurnTakingDataset(Dataset):
-    def __init__(self, samples: List[Dict], tokenizer: AutoTokenizer, max_length: int = 2048):
+    def __init__(self, samples: List[Dict], tokenizer: AutoTokenizer, max_length: int = 2048, debug: bool = False):
         self.samples = samples
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.debug = debug
+        self.debug_count = 0
     
     def __len__(self):
         return len(self.samples)
@@ -159,6 +158,10 @@ class TurnTakingDataset(Dataset):
             return_tensors="pt"
         )
         
+        if self.debug and self.debug_count < 3:
+            decoded = self.tokenizer.decode(encoding["input_ids"][0], skip_special_tokens=False)
+            print(f"[DEBUG] sample {idx} decision={sample.get('decision')} len={encoding['input_ids'].shape[1]} tokens first300={decoded[:300]!r}")
+            self.debug_count += 1
         return {
             "input_ids": encoding["input_ids"].flatten(),
             "attention_mask": encoding["attention_mask"].flatten(),
@@ -173,18 +176,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.data_utils import load_samples
 
 
-def prepare_datasets(tokenizer: AutoTokenizer, max_length: int = 2048):
+def prepare_datasets(tokenizer: AutoTokenizer, max_length: int = 2048, debug: bool = False):
     print("Loading training data...")
     train_samples = load_samples(TRAIN_FILE)
     print(f"  Loaded {len(train_samples):,} training samples")
-    
     print("Loading validation data...")
     val_samples = load_samples(VAL_FILE)
     print(f"  Loaded {len(val_samples):,} validation samples")
     
     print("Creating datasets...")
-    train_dataset = TurnTakingDataset(train_samples, tokenizer, max_length)
-    val_dataset = TurnTakingDataset(val_samples, tokenizer, max_length)
+    train_dataset = TurnTakingDataset(train_samples, tokenizer, max_length, debug=debug)
+    val_dataset = TurnTakingDataset(val_samples, tokenizer, max_length, debug=debug)
     
     print(f"  Train dataset: {len(train_dataset):,} samples")
     print(f"  Val dataset: {len(val_dataset):,} samples")

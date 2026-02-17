@@ -1,50 +1,35 @@
 #!/usr/bin/env python3
 """
-Evaluate Fine-Tuned Model
-
-Comprehensive evaluation of the fine-tuned model and comparison with baseline.
+Evaluate fine-tuned model on test set and compare with baseline. Uses config for model/dataset.
 """
 
+import argparse
 import json
+import os
 import re
+import sys
 import time
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from collections import Counter, defaultdict
+from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 import numpy as np
 
-from load_finetuned import load_finetuned_model
-import sys
-from pathlib import Path
-
 BASE_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(BASE_DIR / 'benchmarking'))
+sys.path.insert(0, str(BASE_DIR / "benchmarking"))
+sys.path.insert(0, str(BASE_DIR))
+from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL
+from load_finetuned import load_finetuned_model
 from evaluate_baseline import (
     format_sample_for_inference,
     extract_decision_from_output,
-    SPEAK_CATEGORIES,
-    SILENT_CATEGORIES,
 )
-
-DATA_DIR = BASE_DIR / 'data'
-TEST_FILE = DATA_DIR / 'test' / 'test_samples.jsonl'
-VAL_FILE = DATA_DIR / 'val' / 'val_samples.jsonl'
-
-EVAL_FILE = TEST_FILE
-
-RESULTS_DIR = Path(__file__).parent / 'results'
-RESULTS_DIR.mkdir(exist_ok=True)
-RESULTS_FILE = RESULTS_DIR / 'finetuned_results.json'
-COMPARISON_FILE = RESULTS_DIR / 'baseline_vs_finetuned.json'
+from utils.data_utils import load_samples
 
 USE_VLLM = True
 BATCH_SIZE = 32 if USE_VLLM else 4
 MAX_NEW_TOKENS = 50
 TEMPERATURE = 0.0
 STOP_AFTER_DECISION = True
-
-
-from utils.data_utils import load_samples
 
 
 
@@ -142,20 +127,14 @@ def evaluate_samples(
     print(f"Batch size: {effective_batch_size} ({'vLLM' if is_vllm_model else 'transformers'})")
     
     prompts = [format_sample_for_inference(sample) for sample in samples]
-    
-    # Run inference in batches
     all_predictions = []
     all_latencies = []
-    
+
     for i in range(0, len(prompts), effective_batch_size):
-        batch_prompts = prompts[i:i+effective_batch_size]
-        batch_samples = samples[i:i+effective_batch_size]
-        
-        # Print progress more frequently
+        batch_prompts = prompts[i : i + effective_batch_size]
+        batch_samples = samples[i : i + effective_batch_size]
         batch_num = i // effective_batch_size + 1
         total_batches = (len(prompts) + effective_batch_size - 1) // effective_batch_size
-        
-        # Show progress more frequently
         if batch_num % 10 == 0 or batch_num == 1:
             print(f"  Processing batch {batch_num}/{total_batches} "
                   f"({len(batch_prompts)} samples, {i+1}/{len(samples)} total)...", end=' ', flush=True)
@@ -246,22 +225,28 @@ def evaluate_samples(
         'latency_stats': latency_stats,
         'false_positive_rate': fpr,
         'false_negative_rate': fnr,
-        'predictions': all_predictions[:100],  # Store first 100 for analysis
+        "predictions": all_predictions[:100],
     }
-    
     return results
 
 
 
-def load_baseline_results() -> Optional[Dict]:
-    baseline_file = BASE_DIR / 'benchmarking' / 'results' / 'baseline_results.json'
-    
+def find_baseline_results(baseline_dir: Path, dataset: str, model_key: str) -> Optional[Path]:
+    for name in [
+        f"baseline_results_{dataset}_{model_key}.json",
+        f"baseline_results_{dataset}_{model_key}_sp1.json",
+        f"baseline_results_{dataset}_{model_key}_sp2.json",
+    ]:
+        p = baseline_dir / name
+        if p.exists():
+            return p
+    return None
+
+
+def load_baseline_results(baseline_file: Path) -> Optional[Dict]:
     if not baseline_file.exists():
-        print(f"\nWarning: Baseline results not found at {baseline_file}")
-        print("   Run benchmarking/evaluate_baseline.py first for comparison.")
         return None
-    
-    with open(baseline_file, 'r') as f:
+    with open(baseline_file, "r") as f:
         return json.load(f)
 
 
@@ -309,56 +294,62 @@ def compare_results(baseline: Dict, finetuned: Dict) -> Dict:
 
 
 
-def main():
-    print("="*70)
-    print("EVALUATING FINE-TUNED MODEL")
-    print("="*70)
-    
-    # Load model
+def main(dataset: str = "ami", model: Optional[str] = None):
+    model_key = model if model is not None else DEFAULT_MODEL
+    if model_key not in MODEL_OPTIONS:
+        model_key = next((k for k in MODEL_OPTIONS.keys() if k == model_key), DEFAULT_MODEL)
+
+    DATA_DIR = BASE_DIR / "data" / dataset
+    TEST_FILE = DATA_DIR / "test" / "test_samples.jsonl"
+    EVAL_FILE = TEST_FILE
+
+    RESULTS_DIR = Path(__file__).parent / "results"
+    RESULTS_DIR.mkdir(exist_ok=True)
+    RESULTS_FILE = RESULTS_DIR / f"finetuned_results_{dataset}_{model_key}.json"
+    COMPARISON_FILE = RESULTS_DIR / f"baseline_vs_finetuned_{dataset}_{model_key}.json"
+
+    print("=" * 70)
+    print(f"EVALUATING FINE-TUNED MODEL: {model_key}")
+    print(f"Dataset: {dataset.upper()}")
+    print("=" * 70)
+
     print("\nLoading fine-tuned model...")
-    model, tokenizer = load_finetuned_model(use_vllm=USE_VLLM)
-    
-    # Load samples
+    model_obj, tokenizer = load_finetuned_model(use_vllm=USE_VLLM)
+
     print(f"\nLoading samples from {EVAL_FILE}...")
     samples = load_samples(EVAL_FILE)
     print(f"Loaded {len(samples)} samples")
-    
-    # Evaluate
-    results = evaluate_samples(samples, model, tokenizer)
-    
-    # Print results
-    print("\n" + "="*70)
+
+    results = evaluate_samples(samples, model_obj, tokenizer)
+
+    print("\n" + "=" * 70)
     print("EVALUATION RESULTS")
-    print("="*70)
+    print("=" * 70)
     print(f"\nTotal samples: {results['total_samples']:,}")
     print(f"Accuracy: {results['accuracy']:.2%}")
     print(f"Correct: {results['correct']:,}")
     print(f"Incorrect: {results['incorrect']:,}")
-    
     print(f"\nFalse Positive Rate (SILENT -> SPEAK): {results['false_positive_rate']:.2%}")
     print(f"False Negative Rate (SPEAK -> SILENT): {results['false_negative_rate']:.2%}")
-    
     print(f"\nLatency Statistics:")
-    for stat, value in results['latency_stats'].items():
+    for stat, value in results["latency_stats"].items():
         print(f"  {stat}: {value:.4f}s")
-    
     print(f"\nPer-Category Accuracy:")
-    for cat in sorted(results['category_accuracy'].keys()):
-        metrics = results['category_accuracy'][cat]
+    for cat in sorted(results["category_accuracy"].keys()):
+        metrics = results["category_accuracy"][cat]
         print(f"  {cat}: {metrics['accuracy']:.2%} ({metrics['correct']}/{metrics['total']})")
-    
-    # Save results
+
     print(f"\nSaving results to {RESULTS_FILE}...")
-    with open(RESULTS_FILE, 'w') as f:
+    with open(RESULTS_FILE, "w") as f:
         json.dump(results, f, indent=2)
     print("Results saved")
-    
-    # Compare with baseline
-    print("\n" + "="*70)
+
+    print("\n" + "=" * 70)
     print("COMPARING WITH BASELINE")
-    print("="*70)
-    
-    baseline = load_baseline_results()
+    print("=" * 70)
+    baseline_dir = BASE_DIR / "benchmarking" / "results"
+    baseline_file = find_baseline_results(baseline_dir, dataset, model_key)
+    baseline = load_baseline_results(baseline_file) if baseline_file else None
     if baseline:
         comparison = compare_results(baseline, results)
         
@@ -385,16 +376,35 @@ def main():
         
         # Save comparison
         print(f"\nSaving comparison to {COMPARISON_FILE}...")
-        with open(COMPARISON_FILE, 'w') as f:
+        with open(COMPARISON_FILE, "w") as f:
             json.dump(comparison, f, indent=2)
         print("Comparison saved")
-    
-    print("\n" + "="*70)
+    else:
+        print(f"\nBaseline results not found in {baseline_dir} for {dataset}/{model_key}.")
+        print("Run benchmarking (e.g. run_benchmark.py or evaluate_baseline.py) first.")
+
+    print("\n" + "=" * 70)
     print("EVALUATION COMPLETE")
-    print("="*70)
-    
+    print("=" * 70)
     return results
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate fine-tuned model")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        choices=["ami", "friends", "spgi"],
+        help="Dataset (default: from DATASET env or ami)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        choices=list(MODEL_OPTIONS.keys()),
+        help="Model key (default: from MODEL env or config)",
+    )
+    args = parser.parse_args()
+    dataset = args.dataset or os.environ.get("DATASET", "ami")
+    main(dataset=dataset, model=args.model)

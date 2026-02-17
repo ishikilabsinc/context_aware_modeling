@@ -1,0 +1,23 @@
+# Unified requirements for context-aware turn-taking (benchmarking, fine_tuning, evaluation, ami).
+# Install from repo root: pip install -r requirements.txt
+
+# Core
+torch>=2.0.0
+transformers>=4.37.0
+numpy>=1.24.0
+accelerate>=0.20.0
+
+# Benchmarking (prepare_data S3, evaluate_baseline, run_benchmark)
+boto3>=1.28.0
+vllm>=0.2.0
+
+# Fine-tuning (LoRA, train_lora)
+peft>=0.6.0
+bitsandbytes>=0.41.0
+datasets>=2.14.0
+
+# Evaluation uses same stack as benchmarking + peft (load_finetuned).
+
+# AMI pipeline (optional)
+google-generativeai>=0.3.0
+openai>=1.0.0

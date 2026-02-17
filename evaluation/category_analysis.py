@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """
-Category-Specific Analysis
-
-Detailed analysis of model performance by category (I1-I3, S1-S5).
+Per-category performance analysis of fine-tuned evaluation results.
 """
 
+import argparse
 import json
-from pathlib import Path
-from typing import Dict
-from collections import defaultdict, Counter
-
-
-RESULTS_DIR = Path(__file__).parent / 'results'
-RESULTS_FILE = RESULTS_DIR / 'finetuned_results.json'
-ANALYSIS_FILE = RESULTS_DIR / 'category_analysis.txt'
-
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from utils.constants import CATEGORY_NAMES
+from typing import Dict
+from collections import Counter, defaultdict
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+from utils.constants import CATEGORY_NAMES, SPEAK_CATEGORIES, SILENT_CATEGORIES
+
+RESULTS_DIR = Path(__file__).parent / "results"
 
 
 def load_results(file_path: Path) -> Dict:
@@ -88,113 +84,82 @@ def analyze_error_patterns(results: Dict) -> Dict:
 
 def generate_report(results: Dict) -> str:
     lines = []
-    lines.append("="*70)
+    lines.append("=" * 70)
     lines.append("CATEGORY-SPECIFIC ANALYSIS")
-    lines.append("="*70)
+    lines.append("=" * 70)
     lines.append("")
-    
-    # Overall metrics
     lines.append("OVERALL PERFORMANCE")
-    lines.append("-"*70)
+    lines.append("-" * 70)
     lines.append(f"Total samples: {results['total_samples']:,}")
     lines.append(f"Accuracy: {results['accuracy']:.2%}")
     lines.append(f"Correct: {results['correct']:,}")
     lines.append(f"Incorrect: {results['incorrect']:,}")
     lines.append("")
-    
-    # Category performance
+
     cat_analysis = analyze_category_performance(results)
-    
     lines.append("PER-CATEGORY PERFORMANCE")
-    lines.append("-"*70)
-    
-    # SPEAK categories
+    lines.append("-" * 70)
     lines.append("\nSPEAK Categories:")
-    for cat in ['I1', 'I2', 'I3']:
+    for cat in SPEAK_CATEGORIES:
         if cat in cat_analysis:
-            analysis = cat_analysis[cat]
-            lines.append(f"\n  {cat} - {analysis['name']}:")
-            lines.append(f"    Accuracy: {analysis['accuracy']:.2%}")
-            lines.append(f"    Correct: {analysis['correct']}/{analysis['total']}")
-            lines.append(f"    Errors: {analysis['errors']}")
-            if analysis['confusion']:
-                lines.append(f"    Confusion:")
-                for pattern, count in analysis['confusion'].items():
+            a = cat_analysis[cat]
+            lines.append(f"\n  {cat} - {a['name']}:")
+            lines.append(f"    Accuracy: {a['accuracy']:.2%} Correct: {a['correct']}/{a['total']} Errors: {a['errors']}")
+            if a["confusion"]:
+                for pattern, count in a["confusion"].items():
                     lines.append(f"      {pattern}: {count}")
-    
-    # SILENT categories
     lines.append("\nSILENT Categories:")
-    for cat in ['S1', 'S2', 'S3', 'S4', 'S5']:
+    for cat in SILENT_CATEGORIES:
         if cat in cat_analysis:
-            analysis = cat_analysis[cat]
-            lines.append(f"\n  {cat} - {analysis['name']}:")
-            lines.append(f"    Accuracy: {analysis['accuracy']:.2%}")
-            lines.append(f"    Correct: {analysis['correct']}/{analysis['total']}")
-            lines.append(f"    Errors: {analysis['errors']}")
-            if analysis['confusion']:
-                lines.append(f"    Confusion:")
-                for pattern, count in analysis['confusion'].items():
+            a = cat_analysis[cat]
+            lines.append(f"\n  {cat} - {a['name']}:")
+            lines.append(f"    Accuracy: {a['accuracy']:.2%} Correct: {a['correct']}/{a['total']} Errors: {a['errors']}")
+            if a["confusion"]:
+                for pattern, count in a["confusion"].items():
                     lines.append(f"      {pattern}: {count}")
-    
     lines.append("")
-    
-    # Error analysis
     error_analysis = analyze_error_patterns(results)
     lines.append("ERROR ANALYSIS")
-    lines.append("-"*70)
-    lines.append(f"\nTotal errors: {error_analysis['total_errors']:,}")
-    lines.append(f"Error rate: {error_analysis['error_rate']:.2%}")
-    
+    lines.append("-" * 70)
+    lines.append(f"\nTotal errors: {error_analysis['total_errors']:,} Rate: {error_analysis['error_rate']:.2%}")
     lines.append("\nErrors by category:")
-    for cat, count in sorted(error_analysis['by_category'].items(), key=lambda x: x[1], reverse=True):
-        cat_name = CATEGORY_NAMES.get(cat, cat)
-        lines.append(f"  {cat} ({cat_name}): {count}")
-    
+    for cat, count in sorted(error_analysis["by_category"].items(), key=lambda x: x[1], reverse=True):
+        lines.append(f"  {cat} ({CATEGORY_NAMES.get(cat, cat)}): {count}")
     lines.append("\nError rate by decision type:")
-    for decision, metrics in error_analysis['by_decision_type'].items():
-        error_rate = metrics['errors'] / metrics['total'] if metrics['total'] > 0 else 0
-        lines.append(f"  {decision}: {error_rate:.2%} ({metrics['errors']}/{metrics['total']})")
-    
+    for decision, metrics in error_analysis["by_decision_type"].items():
+        rate = metrics["errors"] / metrics["total"] if metrics["total"] > 0 else 0
+        lines.append(f"  {decision}: {rate:.2%} ({metrics['errors']}/{metrics['total']})")
     lines.append("\nMost common confusion patterns:")
-    for pattern, count in error_analysis['confusion_patterns'].most_common(10):
+    for pattern, count in error_analysis["confusion_patterns"].most_common(10):
         lines.append(f"  {pattern}: {count}")
-    
     lines.append("")
-    lines.append("="*70)
-    
+    lines.append("=" * 70)
     return "\n".join(lines)
 
 
 
-def main():
-    print("="*70)
-    print("CATEGORY-SPECIFIC ANALYSIS")
-    print("="*70)
-    
-    if not RESULTS_FILE.exists():
-        print(f"\nError: Results file not found: {RESULTS_FILE}")
-        print("Please run evaluate_finetuned.py first.")
+def main(dataset: str = "ami", model: str = None):
+    from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL
+    model_key = model or DEFAULT_MODEL
+    if model_key not in MODEL_OPTIONS:
+        model_key = DEFAULT_MODEL
+    results_file = RESULTS_DIR / f"finetuned_results_{dataset}_{model_key}.json"
+    analysis_file = RESULTS_DIR / f"category_analysis_{dataset}_{model_key}.txt"
+
+    if not results_file.exists():
+        print(f"Results file not found: {results_file}. Run evaluate_finetuned.py first.")
         return
-    
-    print(f"\nLoading results from {RESULTS_FILE}...")
-    results = load_results(RESULTS_FILE)
-    
-    print("Generating category analysis...")
+    results = load_results(results_file)
     report = generate_report(results)
-    
-    # Print to console
     print("\n" + report)
-    
-    # Save to file
-    print(f"\nSaving analysis to {ANALYSIS_FILE}...")
-    with open(ANALYSIS_FILE, 'w') as f:
+    with open(analysis_file, "w") as f:
         f.write(report)
-    print("Analysis saved")
-    
-    print("\n" + "="*70)
-    print("ANALYSIS COMPLETE")
-    print("="*70)
+    print(f"Analysis saved to {analysis_file}")
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Category analysis of fine-tuned results")
+    parser.add_argument("--dataset", type=str, default="ami", choices=["ami", "friends", "spgi"])
+    parser.add_argument("--model", type=str, default=None, help="Model key (default: from MODEL env)")
+    args = parser.parse_args()
+    main(dataset=args.dataset, model=args.model)

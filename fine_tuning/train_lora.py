@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-LoRA Fine-Tuning Script
-
-Fine-tunes QWEN model with LoRA adapters for context-aware turn-taking.
+LoRA fine-tuning for context-aware turn-taking. Uses config for model, dataset, paths.
 """
 
+import argparse
+import importlib
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -21,15 +25,6 @@ from peft import (
     TaskType
 )
 import torch
-
-from config import (
-    BASE_MODEL,
-    LORA_CONFIG,
-    TRAINING_CONFIG,
-    OUTPUT_DIR,
-    FINAL_MODEL_DIR
-)
-from data_loader import prepare_datasets, data_collator
 
 
 def setup_model_and_tokenizer():
@@ -87,23 +82,34 @@ def setup_model_and_tokenizer():
 
 def compute_metrics(eval_pred):
     import numpy as np
-    
     predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=-1)
-    
     mask = labels != -100
     matches = (predictions == labels) & mask
     accuracy = np.sum(matches) / np.sum(mask) if np.sum(mask) > 0 else 0.0
+    return {"accuracy": accuracy}
+
+
+
+def main(dataset: str = "ami"):
+    os.environ["DATASET"] = dataset
+    if "config" in sys.modules:
+        importlib.reload(sys.modules["config"])
+    from config import (
+        BASE_MODEL,
+        LORA_CONFIG,
+        TRAINING_CONFIG,
+        OUTPUT_DIR,
+        FINAL_MODEL_DIR,
+        DATASET,
+        TRAIN_FILE,
+        VAL_FILE
+    )
+    from data_loader import prepare_datasets, data_collator
     
-    return {
-        "accuracy": accuracy,
-    }
-
-
-
-def main():
     print("="*70)
-    print("LORA FINE-TUNING FOR CONTEXT-AWARE TURN-TAKING")
+    print(f"LORA FINE-TUNING FOR CONTEXT-AWARE TURN-TAKING")
+    print(f"Dataset: {DATASET}")
     print("="*70)
     
     # Setup model
@@ -113,7 +119,11 @@ def main():
     print("\n" + "="*70)
     print("PREPARING DATASETS")
     print("="*70)
-    train_dataset, val_dataset = prepare_datasets(tokenizer, max_length=384)
+    print(f"Train file: {TRAIN_FILE}")
+    print(f"Val file: {VAL_FILE}")
+    
+    DEBUG = os.environ.get("DEBUG_TRAINING", "false").lower() == "true"
+    train_dataset, val_dataset = prepare_datasets(tokenizer, max_length=384, debug=DEBUG)
     
     # Training arguments
     print("\n" + "="*70)
@@ -169,5 +179,14 @@ def main():
     print("="*70)
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fine-tune model with LoRA")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="ami",
+        choices=["ami", "friends", "spgi"],
+        help="Dataset name (default: ami)",
+    )
+    args = parser.parse_args()
+    main(dataset=args.dataset)

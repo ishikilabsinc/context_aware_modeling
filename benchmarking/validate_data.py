@@ -1,33 +1,24 @@
 #!/usr/bin/env python3
 """
-Validate Data Format
-
-Validates that downloaded samples match the expected training format and generates statistics.
-
-Expected format (from ami/stage5_format_training.py):
-- Input sections: <|system|>, <|instruction|>, <|context|>, <|current|>
-- Output format: <decision>, <confidence>, <reason>
+Validate sample format and generate statistics.
+Expected: input sections (system, instruction, context, current), output tags (decision, confidence, reason).
 """
 
+import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import List, Dict, Tuple
 from collections import Counter, defaultdict
 
-
 BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / 'data'
-
-# Expected sections in training format
-REQUIRED_SECTIONS = ['system', 'instruction', 'context', 'current']
-REQUIRED_OUTPUT_TAGS = ['decision', 'confidence', 'reason']
-
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(BASE_DIR))
 from utils.constants import SPEAK_CATEGORIES, SILENT_CATEGORIES, ALL_CATEGORIES
 from utils.data_utils import load_samples
+
+REQUIRED_SECTIONS = ['system', 'instruction', 'context', 'current']
+REQUIRED_OUTPUT_TAGS = ['decision', 'confidence', 'reason']
 
 
 def validate_training_format(sample: Dict) -> Tuple[bool, List[str]]:
@@ -117,16 +108,10 @@ def generate_statistics(samples: List[Dict]) -> Dict:
         
         if is_valid:
             stats['validation_results']['valid'] += 1
-            
-            # Extract decision
             decision = extract_decision(sample)
             stats['decisions'][decision] += 1
-            
-            # Extract category
             category = extract_category(sample)
             stats['categories'][category] += 1
-            
-            # Extract confidence
             if 'confidence' in sample:
                 stats['confidence_levels'][sample['confidence']] += 1
             elif 'text' in sample:
@@ -147,8 +132,6 @@ def print_statistics(stats: Dict, dataset_name: str = "Dataset"):
     print("="*70)
     
     print(f"\nTotal samples: {stats['total_samples']:,}")
-    
-    # Validation results
     valid = stats['validation_results']['valid']
     invalid = stats['validation_results']['invalid']
     valid_pct = (valid / stats['total_samples'] * 100) if stats['total_samples'] > 0 else 0
@@ -161,21 +144,15 @@ def print_statistics(stats: Dict, dataset_name: str = "Dataset"):
         print(f"\n  Common errors:")
         for error, count in sorted(stats['validation_results']['errors'].items(), key=lambda x: x[1], reverse=True)[:5]:
             print(f"    - {error}: {count}")
-    
-    # Decision distribution
     if stats['decisions']:
         print(f"\nDecision distribution:")
         total_decisions = sum(stats['decisions'].values())
         for decision, count in stats['decisions'].most_common():
             pct = (count / total_decisions * 100) if total_decisions > 0 else 0
             print(f"  {decision}: {count:,} ({pct:.1f}%)")
-    
-    # Category distribution
     if stats['categories']:
         print(f"\nCategory distribution:")
         total_categories = sum(stats['categories'].values())
-        
-        # Group by SPEAK vs SILENT
         speak_cats = {k: v for k, v in stats['categories'].items() if k in SPEAK_CATEGORIES}
         silent_cats = {k: v for k, v in stats['categories'].items() if k in SILENT_CATEGORIES}
         
@@ -197,8 +174,6 @@ def print_statistics(stats: Dict, dataset_name: str = "Dataset"):
         if unknown > 0:
             pct = (unknown / total_categories * 100) if total_categories > 0 else 0
             print(f"    UNKNOWN: {unknown:,} ({pct:.1f}%)")
-    
-    # Confidence distribution
     if stats['confidence_levels']:
         print(f"\nConfidence distribution:")
         total_conf = sum(stats['confidence_levels'].values())
@@ -210,13 +185,13 @@ def print_statistics(stats: Dict, dataset_name: str = "Dataset"):
 
 
 
-def main():
-    """Main execution function"""
+def main(dataset: str = 'ami'):
+    DATA_DIR = BASE_DIR / 'data' / dataset
+    
     print("="*70)
-    print("VALIDATING DATA FORMAT")
+    print(f"VALIDATING DATA FORMAT FOR DATASET: {dataset.upper()}")
     print("="*70)
     
-    # Check for data files
     train_file = DATA_DIR / 'train' / 'train_samples.jsonl'
     val_file = DATA_DIR / 'val' / 'val_samples.jsonl'
     test_file = DATA_DIR / 'test' / 'test_samples.jsonl'
@@ -243,14 +218,10 @@ def main():
         
         print(f"  Loaded {len(samples):,} samples")
         
-        # Generate statistics
         stats = generate_statistics(samples)
         all_stats[dataset_name] = stats
-        
-        # Print statistics
         print_statistics(stats, dataset_name)
-    
-    # Summary
+
     if all_stats:
         print("\n" + "="*70)
         print("SUMMARY")
@@ -264,7 +235,6 @@ def main():
         print(f"  Valid:   {total_valid:,} ({total_valid/total_samples*100:.1f}%)")
         print(f"  Invalid: {total_invalid:,} ({total_invalid/total_samples*100:.1f}%)")
         
-        # Overall decision distribution
         all_decisions = Counter()
         for stats in all_stats.values():
             all_decisions.update(stats['decisions'])
@@ -279,8 +249,13 @@ def main():
         print("VALIDATION COMPLETE")
         print("="*70)
     else:
-        print("\nNo data files found. Please run download_data.py first.")
+        print("\nNo data files found. Please run prepare_data.py first.")
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Validate dataset format')
+    parser.add_argument('--dataset', type=str, default='ami',
+                       choices=['ami', 'friends', 'spgi'],
+                       help='Dataset name (default: ami)')
+    args = parser.parse_args()
+    main(dataset=args.dataset)

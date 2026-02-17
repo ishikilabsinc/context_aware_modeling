@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Baseline Evaluation for QWEN 8B
-
-Evaluates the base QWEN 8B model (before fine-tuning) on the turn-taking task.
-Measures accuracy, latency, and per-category performance.
+Baseline evaluation for instruct models on the turn-taking task.
+Model and dataset selectable via CLI or environment (MODEL, DATASET).
+Reports accuracy, latency, and per-category performance.
 """
 
 import json
@@ -11,6 +10,7 @@ import re
 import time
 import sys
 import os
+import argparse
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import Counter, defaultdict
@@ -19,45 +19,115 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.constants import SPEAK_CATEGORIES, SILENT_CATEGORIES
 from utils.data_utils import load_samples
+from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL, BASE_MODEL as DEFAULT_BASE_MODEL
 
-# Model configuration
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+# Model / inference configuration
 USE_VLLM = True
 FALLBACK_TO_TRANSFORMERS = True
 
-
 BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / 'data'
-TEST_FILE = DATA_DIR / 'test' / 'test_samples.jsonl'
-VAL_FILE = DATA_DIR / 'val' / 'val_samples.jsonl'
-
-# Use validation set for baseline (test set reserved for final evaluation)
-EVAL_FILE = VAL_FILE
-
-# Output file
-RESULTS_DIR = Path(__file__).parent / 'results'
-RESULTS_DIR.mkdir(exist_ok=True)
-RESULTS_FILE = RESULTS_DIR / 'baseline_results.json'
 
 # Inference settings
-BATCH_SIZE = 32 if USE_VLLM else 1  # vLLM supports batching, transformers doesn't
-MAX_NEW_TOKENS = 50  # Limit generation for fast inference
-TEMPERATURE = 0.0  # Deterministic outputs
-STOP_AFTER_DECISION = True  # Truncate after </decision> tag for latency
+BATCH_SIZE = 32 if USE_VLLM else 1
+MAX_NEW_TOKENS = 128
+MAX_NEW_TOKENS_QWEN3 = 192
+TEMPERATURE = 0.0
+STOP_AFTER_DECISION = True
 
-class QwenModelLoader:
-    """Load and configure QWEN model for inference."""
-    def __init__(self, use_vllm: bool = USE_VLLM):
+# In saved results, show at most this many context turns per example (latest w.r.t current turn)
+MAX_CONTEXT_TURNS_IN_RESULTS = 20
+
+# System prompt for the model
+SYSTEM_PROMPT = """
+    You are a turn-taking decision model in a multi-party conversation where multiple people are talking.
+    You are roleplaying the role of the target speaker you are given.
+    Your job is to decide whether the target speaker should START TALKING or STAY SILENT after a detected pause in conversation.
+
+    You will receive:
+        1. An instruction telling you the target speaker role (e.g., "Speaker C" or "Speaker X" or "Nova")
+        2. The previous conversation context with speaker-labeled transcript
+        3. Most recent utterance: the most recent utterance said in the conversation, after which you have to make a decision
+
+    First, determine the target speaker's ROLE in the current exchange:
+        - ACTIVE PARTICIPANT: The target speaker has been speaking, was addressed, or is part of an ongoing back-and-forth in the current topic.
+        - BYSTANDER: The target speaker has not been involved in the current exchange and is passively listening.
+
+    RULES FOR DECIDING:
+
+        Output SILENT when:
+        - The target speaker is a BYSTANDER and the recent utterance is directed at someone else
+        - The target speaker has not been referenced, addressed, or involved, and the context does not suggest they are expected to contribute
+        - The recent utterance is clearly incomplete — the speaker is visibly mid-sentence or mid-clause and still formulating their thought
+        - Someone mentions the target speaker in third person without expecting a response (e.g., "I was telling Speaker X about this earlier")
+
+        Output SPEAK when:
+        - The recent utterance directly addresses the target speaker by name/role with a question or request, possibly with ASR errors
+        - The recent utterance asked the target speaker something and this is a clear follow-up to that exchange (even without re-stating the name)
+        - The context makes it unambiguous that the speaker is waiting for the target speaker to respond
+        - The speaker redirects the conversation to the target speaker (e.g., "What do you think?" in a context where the target speaker was part of the prior exchange)
+        - The recent utterance is a general or group-directed question (e.g., "What do we think?", "Anyone disagree?", "Right?", "You know?") and the target speaker is part of the group
+        - The target speaker is an ACTIVE PARTICIPANT and the recent utterance completes a thought, story, opinion, or statement on the topic they have been engaging with — a response (agreement, reaction, follow-up, acknowledgment) is socially expected to maintain natural conversational flow
+        - The target speaker previously asked a question or made a request, and the recent utterance is the answer or response to it — the target speaker is expected to acknowledge or follow up
+        - The target speaker is an ACTIVE PARTICIPANT and staying silent would unnaturally drop them from the conversation or create an awkward pause
+        - The conversation has reached a natural transition point where a brief backchannel or reactive response (e.g., agreement, laughter, "wow", "yeah") from the target speaker would be natural given the content
+
+    IMPORTANT NUANCES:
+        - The key distinction is ACTIVE PARTICIPANT vs BYSTANDER. Active participants should SPEAK at natural turn boundaries. Bystanders should default to SILENT unless directly addressed.
+        - When uncertain AND the target speaker is a bystander → prefer SILENT
+        - When uncertain AND the target speaker has been actively participating in this exchange → consider whether the most recent utterance is clearly directed at someone else or is a self-contained statement. If so, SILENT is still correct even for active participants.
+        - False interruptions of OTHER PEOPLE'S conversations are bad, but failing to respond when you are part of the conversation is equally bad — it kills the interaction
+
+    Output your response in this EXACT format:
+
+        <reasoning>Determine if target speaker is an ACTIVE PARTICIPANT or BYSTANDER, then explain in 1 sentence who is being addressed and whether the target speaker should respond.</reasoning>
+        <decision>SPEAK</decision> or <decision>SILENT</decision>
+        <confidence>high, medium, or low</confidence>
+
+    CRITICAL: The <decision> tag must contain ONLY the single word SPEAK or SILENT. Nothing else.
+
+    EXAMPLES:
+
+    EXAMPLE 1:
+    Target speaker: Alex
+    Speakers: Alex, Sam
+    Recent utterance (Sam): "Wait, you actually told her?"
+    <reasoning>Alex is an ACTIVE PARTICIPANT — Sam is directly asking Alex a question. A response is expected.</reasoning>
+    <decision>SPEAK</decision>
+    <confidence>high</confidence>
+
+    EXAMPLE 2:
+    Target speaker: Jordan
+    Speakers: Alex, Jordan, Sam
+    Recent utterance (Alex): "Yeah, it was rough. I didn't sleep at all last night."
+    <reasoning>Jordan is a BYSTANDER — Alex is narrating a personal experience to the group. Jordan hasn't been addressed or involved. No response expected.</reasoning>
+    <decision>SILENT</decision>
+    <confidence>high</confidence>
+    """
+
+# Use system prompt once (1) or twice (2).
+SYSTEM_PROMPT_REPEAT = 2
+
+
+def _get_system_prompt_content() -> str:
+    """Return SYSTEM_PROMPT repeated SYSTEM_PROMPT_REPEAT times."""
+    base = SYSTEM_PROMPT.strip()
+    return "\n\n".join([base] * SYSTEM_PROMPT_REPEAT)
+
+
+class InstructModelLoader:
+    """Load and configure instruct model for inference."""
+    def __init__(self, model_id: str, use_vllm: bool = USE_VLLM):
+        self.model_id = model_id
         self.use_vllm = use_vllm
-    
+
     def load(self) -> Dict:
         hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-        if not hf_token and not os.path.exists(MODEL_NAME):
+        if not hf_token and not os.path.exists(self.model_id):
             print("\nWarning: No HuggingFace token found and model is not local.")
             print("   If the model is gated, you may need to:")
             print("   1. Run: huggingface-cli login")
             print("   2. Or set: export HF_TOKEN='your_token'\n")
-        
+
         if self.use_vllm:
             try:
                 return self._load_vllm()
@@ -74,17 +144,17 @@ class QwenModelLoader:
                     raise
         else:
             return self._load_transformers()
-    
+
     def _load_vllm(self) -> Dict:
         from vllm import LLM
         from transformers import AutoTokenizer
-        
-        print("Loading QWEN model with vLLM...")
-        print(f"Model: {MODEL_NAME}")
-        
+
+        print("Loading model with vLLM...")
+        print(f"Model: {self.model_id}")
+
         hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
         llm = LLM(
-            model=MODEL_NAME,
+            model=self.model_id,
             dtype="bfloat16",
             tensor_parallel_size=1,
             max_model_len=16384,
@@ -92,128 +162,189 @@ class QwenModelLoader:
             max_num_seqs=128,
             trust_remote_code=True,
         )
-        
+
         tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_NAME,
+            self.model_id,
             trust_remote_code=True,
             token=hf_token,
         )
-        
+
         print("Model loaded successfully with vLLM")
         return {"model": llm, "tokenizer": tokenizer, "use_vllm": True}
-    
+
     def _load_transformers(self) -> Dict:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        
-        print("Loading QWEN model with transformers...")
-        print(f"Model: {MODEL_NAME}")
-        
+
+        print("Loading model with transformers...")
+        print(f"Model: {self.model_id}")
+
         hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
         tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_NAME,
+            self.model_id,
             trust_remote_code=True,
             token=hf_token,
         )
-        
+
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
+            self.model_id,
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
             token=hf_token,
         )
-        
+
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        
+
         print("Model loaded successfully with transformers")
         return {"model": model, "tokenizer": tokenizer, "use_vllm": False}
 
 
 def format_sample_for_inference(sample: Dict) -> str:
-    system_prompt = """You are a turn-taking decision model for a voice AI agent. Your job is to decide whether the AI agent should START TALKING or STAY SILENT after a detected pause in conversation.
+    system_prompt = _get_system_prompt_content()
 
-You will receive:
-1. An instruction telling you which speaker role the AI agent plays (e.g., "Speaker C" or "Speaker X" or "Nova")
-2. The previous conversation context with speaker-labeled transcript
-3. The current line: the most recent utterance before the pause
-
-RULES FOR DECIDING:
-
-STAY SILENT when:
-- The current speaker is talking to someone else, not the AI agent
-- The AI agent's name/role has not been referenced or addressed
-- The speaker is mid-thought, brainstorming, or thinking aloud and not seeking input
-- The sentence is clearly incomplete and the speaker is still formulating their thought
-- The conversation is between other participants and does not involve the AI agent
-- Someone mentions the AI agent in passing but is not requesting a response (e.g., "I was telling Speaker X about this earlier")
-- The speaker is making a rhetorical statement or exclamation, not asking a question
-
-START TALKING when:
-- The speaker directly addresses the AI agent by name/role with a question or request, possibly with ASR errors
-- The speaker asked the AI agent something and this is a clear follow-up to that exchange (even without re-stating the name)
-- The context makes it unambiguous that the speaker is waiting for the AI agent's response
-- The speaker redirects the conversation to the AI agent (e.g., "What do you think?" in a context where AI was part of the prior exchange)
-
-IMPORTANT NUANCES:
-- Once someone initiates a dialogue with the AI agent, follow-up turns from the same speaker are likely still directed at the AI agent until context clearly shifts away
-- In multi-party conversations, default to SILENT unless there is clear evidence the AI agent is being addressed
-- ASR (speech recognition) errors are common -- account for misspellings, homophones, and garbled names
-- When uncertain, prefer SILENT -- false interruptions are far worse than missed turns
-- An incomplete sentence after a long pause should remain SILENT if context suggests the speaker is still thinking, but should START TALKING if the incomplete sentence is clearly directed at the AI agent as a trailing question
-
-Output your decision in this exact format:
-<decision>SILENT or SPEAK</decision>
-<confidence>high, medium, or low</confidence>
-<reason>one line explanation</reason>"""
-    
     context_turns = sample.get('context_turns', [])
-    if context_turns:
-        context_str = '\n'.join([
+    current_turn = sample.get('current_turn', {})
+
+    all_turns = context_turns + ([current_turn] if current_turn else [])
+    if all_turns:
+        context_lines = [
             f"Speaker {turn['speaker']}: {turn['text']}"
-            for turn in context_turns
-        ])
+            for turn in all_turns[:-1]
+        ]
+        if current_turn:
+            context_lines.append(f"Speaker {current_turn.get('speaker', '?')}: {current_turn.get('text', '')}  [MOST RECENT - after this there was a pause]")
+        context_str = '\n'.join(context_lines)
     else:
         context_str = "(No previous context)"
-    
-    current_turn = sample.get('current_turn', {})
-    current_str = f"Speaker {current_turn.get('speaker', '?')}: {current_turn.get('text', '')}"
-    
+
+    if current_turn:
+        current_str = f"Speaker {current_turn.get('speaker', '?')}: {current_turn.get('text', '')}"
+    else:
+        current_str = "(No current utterance)"
+
     target_speaker = sample.get('target_speaker', '?')
-    instruction = f"You are playing the role of Speaker {target_speaker}. Decide if you should SPEAK or stay SILENT after the current utterance."
-    
+    instruction = f"You are playing the role of Speaker {target_speaker}. The conversation history above shows all utterances including the most recent one (marked as [MOST RECENT]). After that most recent utterance, there was a pause. Decide if you (Speaker {target_speaker}) should START TALKING or STAY SILENT now."
+
     prompt = f"""<|system|>{system_prompt}<|/system|>
 <|instruction|>{instruction}<|/instruction|>
 <|context|>{context_str}<|/context|>
-<|current|>{current_str}<|/current|>
+<|current|>MOST RECENT UTTERANCE (the previous utterance that just occurred): {current_str}<|/current|>
+Reply with your decision in this exact format: <reasoning>One sentence: ACTIVE PARTICIPANT or BYSTANDER, and who is addressed.</reasoning> <decision>SPEAK</decision> or <decision>SILENT</decision> <confidence>high</confidence> or <confidence>medium</confidence> or <confidence>low</confidence>
 <decision>"""
-    
+
     return prompt
 
 
+def is_qwen3(model_id: str) -> bool:
+    """True if model uses chat template with enable_thinking=False."""
+    return model_id and "qwen3" in model_id.lower()
+
+
+def get_max_new_tokens(model_id: Optional[str] = None) -> int:
+    return MAX_NEW_TOKENS_QWEN3 if model_id and is_qwen3(model_id) else MAX_NEW_TOKENS
+
+
+def format_sample_for_qwen3(sample: Dict, tokenizer) -> str:
+    """Build prompt using chat template with enable_thinking=False."""
+    context_turns = sample.get('context_turns', [])
+    current_turn = sample.get('current_turn', {})
+
+    all_turns = context_turns + ([current_turn] if current_turn else [])
+    if all_turns:
+        context_lines = [
+            f"Speaker {turn['speaker']}: {turn['text']}"
+            for turn in all_turns[:-1]
+        ]
+        if current_turn:
+            context_lines.append(f"Speaker {current_turn.get('speaker', '?')}: {current_turn.get('text', '')}  [MOST RECENT - after this there was a pause]")
+        context_str = '\n'.join(context_lines)
+    else:
+        context_str = "(No previous context)"
+
+    if current_turn:
+        current_str = f"Speaker {current_turn.get('speaker', '?')}: {current_turn.get('text', '')}"
+    else:
+        current_str = "(No current utterance)"
+
+    target_speaker = sample.get('target_speaker', '?')
+    instruction = f"You are playing the role of Speaker {target_speaker}. The conversation history above shows all utterances including the most recent one (marked as [MOST RECENT]). After that most recent utterance, there was a pause. Decide if you (Speaker {target_speaker}) should START TALKING or STAY SILENT now."
+
+    user_content = f"""{instruction}
+
+CONVERSATION CONTEXT:
+{context_str}
+
+MOST RECENT UTTERANCE (the previous utterance that just occurred): {current_str}
+
+Reply with your decision in this exact format: <reasoning>One sentence: ACTIVE PARTICIPANT or BYSTANDER, and who is addressed.</reasoning> <decision>SPEAK</decision> or <decision>SILENT</decision> <confidence>high</confidence> or <confidence>medium</confidence> or <confidence>low</confidence>"""
+
+    messages = [
+        {"role": "system", "content": _get_system_prompt_content()},
+        {"role": "user", "content": user_content.strip()},
+    ]
+    try:
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return prompt
+
 
 def extract_decision_from_output(text: str) -> Optional[str]:
-    match = re.search(r'<decision>(.*?)</decision>', text, re.DOTALL | re.IGNORECASE)
-    if match:
-        decision = match.group(1).strip().upper()
-        if decision in ['SPEAK', 'SILENT']:
-            return decision
-        if 'SPEAK' in decision or 'TALK' in decision:
-            return 'SPEAK'
-        if 'SILENT' in decision:
-            return 'SILENT'
+    # Prefer last <decision>...</decision> when multiple (model may output role then actual decision)
+    tag_matches = re.findall(r'<decision>(.*?)</decision>', text, re.DOTALL | re.IGNORECASE)
+    if tag_matches:
+        decision = tag_matches[-1].strip().upper()
+    else:
+        match = re.search(r'^(.*?)</decision>', text, re.DOTALL | re.IGNORECASE)
+        if match:
+            decision = match.group(1).strip().upper()
+        else:
+            underscore_match = re.search(r'_([A-Z]+)_', text, re.IGNORECASE)
+            if underscore_match:
+                decision = underscore_match.group(1).strip().upper()
+            else:
+                decision_match = re.search(r'^(STAY\s+)?(SILENT|SPEAK|TALK|START\s+TALK)', text, re.IGNORECASE)
+                if decision_match and decision_match.group(2):
+                    decision = decision_match.group(2).upper()
+                else:
+                    return None
+
+    if decision == 'SPEAK' or decision == 'SILENT':
+        return decision
+    if 'SPEAK' in decision:
+        return 'SPEAK'
+    if 'SILENT' in decision:
+        return 'SILENT'
+    if ('SPEAK' in decision or 'TALK' in decision or 'START' in decision) and 'PARTICIPANT' not in decision:
+        return 'SPEAK'
+    if ('SILENT' in decision or 'STAY' in decision) and 'PARTICIPANT' not in decision:
+        return 'SILENT'
+    # Fallback: model put role in <decision> tag (ACTIVE PARTICIPANT -> SPEAK, BYSTANDER -> SILENT)
+    if 'ACTIVE PARTICIPANT' in decision or decision == 'ACTIVE PARTICIPANT':
+        return 'SPEAK'
+    if 'BYSTANDER' in decision:
+        return 'SILENT'
     return None
 
 
-def infer_with_vllm(model, tokenizer, prompts: List[str]) -> List[Tuple[str, float]]:
-    """Run inference using vLLM with batching."""
+def infer_with_vllm(model, tokenizer, prompts: List[str], model_id: Optional[str] = None) -> List[Tuple[str, float]]:
     from vllm import SamplingParams
-    
+
+    stop = None
+    if model_id and is_qwen3(model_id):
+        stop = ["<|end_of_turn|>", "<|start_of_turn|>", "<|im_end|>"]
+    max_tokens = get_max_new_tokens(model_id)
     sampling_params = SamplingParams(
         temperature=TEMPERATURE,
-        max_tokens=MAX_NEW_TOKENS,
-        stop=None,
+        max_tokens=max_tokens,
+        stop=stop,
     )
     
     start_time = time.time()
@@ -235,21 +366,23 @@ def infer_with_vllm(model, tokenizer, prompts: List[str]) -> List[Tuple[str, flo
     return results
 
 
-def infer_with_transformers(model, tokenizer, prompts: List[str]) -> List[Tuple[str, float]]:
-    """Run inference using transformers."""
+def infer_with_transformers(
+    model, tokenizer, prompts: List[str], model_id: Optional[str] = None
+) -> List[Tuple[str, float]]:
     import torch
-    
+
+    max_new_tokens = get_max_new_tokens(model_id)
     results = []
-    
+
     for prompt in prompts:
         inputs = tokenizer(prompt, return_tensors="pt", padding=True)
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        
+
         start_time = time.time()
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
+                max_new_tokens=max_new_tokens,
                 temperature=TEMPERATURE if TEMPERATURE > 0 else None,
                 do_sample=TEMPERATURE > 0,
                 pad_token_id=tokenizer.pad_token_id,
@@ -275,13 +408,71 @@ def evaluate_samples(
     model,
     tokenizer,
     use_vllm: bool,
-    batch_size: int = BATCH_SIZE
+    batch_size: int = BATCH_SIZE,
+    debug_prompts: bool = False,
+    model_id: Optional[str] = None,
 ) -> Dict:
     print(f"\nEvaluating {len(samples)} samples...")
     print(f"Batch size: {batch_size}")
     print(f"Using vLLM: {use_vllm}")
+
+    if model_id and is_qwen3(model_id):
+        prompts = [format_sample_for_qwen3(sample, tokenizer) for sample in samples]
+        print("Using chat template (enable_thinking=False)")
+    else:
+        prompts = [format_sample_for_inference(sample) for sample in samples]
     
-    prompts = [format_sample_for_inference(sample) for sample in samples]
+    if debug_prompts:
+        num_debug_samples = min(4, len(samples))
+        print(f"\n{'='*70}")
+        print(f"[DEBUG] Full Prompts for First {num_debug_samples} Samples")
+        print(f"{'='*70}")
+        for idx in range(num_debug_samples):
+            sample = samples[idx]
+            prompt = prompts[idx]
+            
+            system_start = prompt.find('<|system|>')
+            system_end = prompt.find('<|/system|>')
+            if system_start != -1 and system_end != -1:
+                system_prompt = prompt[system_start + len('<|system|>'):system_end].strip()
+            else:
+                system_prompt = "(Not found)"
+            
+            instruction_start = prompt.find('<|instruction|>')
+            instruction_end = prompt.find('<|/instruction|>')
+            if instruction_start != -1 and instruction_end != -1:
+                instruction = prompt[instruction_start + len('<|instruction|>'):instruction_end].strip()
+            else:
+                instruction = "(Not found)"
+            
+            context_start = prompt.find('<|context|>')
+            context_end = prompt.find('<|/context|>')
+            if context_start != -1 and context_end != -1:
+                context = prompt[context_start + len('<|context|>'):context_end].strip()
+            else:
+                context = "(Not found)"
+            
+            current_start = prompt.find('<|current|>')
+            current_end = prompt.find('<|/current|>')
+            if current_start != -1 and current_end != -1:
+                current = prompt[current_start + len('<|current|>'):current_end].strip()
+            else:
+                current = "(Not found)"
+            
+            print(f"\n{'='*70}")
+            print(f"[SAMPLE {idx + 1}] {sample.get('decision_point_id', 'N/A')}")
+            print(f"{'='*70}")
+            print(f"\n--- System Prompt ---")
+            print(system_prompt)
+            print(f"\n--- Instruction Prompt ---")
+            print(instruction)
+            print(f"\n--- Context ---")
+            print(context)
+            print(f"\n--- Current Turn ---")
+            print(current)
+            print(f"\n--- Full Input to Model ---")
+            print(prompt)
+            print(f"{'='*70}\n")
     
     all_predictions = []
     all_latencies = []
@@ -294,28 +485,167 @@ def evaluate_samples(
               f"({len(batch_prompts)} samples)...", end=' ', flush=True)
         
         if use_vllm:
-            batch_results = infer_with_vllm(model, tokenizer, batch_prompts)
+            batch_results = infer_with_vllm(model, tokenizer, batch_prompts, model_id=model_id)
         else:
-            batch_results = infer_with_transformers(model, tokenizer, batch_prompts)
+            batch_results = infer_with_transformers(model, tokenizer, batch_prompts, model_id=model_id)
         
-        for (output_text, latency), sample in zip(batch_results, batch_samples):
+        for batch_idx, ((output_text, latency), sample) in enumerate(zip(batch_results, batch_samples)):
             prediction = extract_decision_from_output(output_text)
             ground_truth = sample.get('decision', 'UNKNOWN')
             
+            if i == 0 and batch_idx < 3:
+                print(f"\n{'='*70}")
+                print(f"[DEBUG] Sample {batch_idx + 1} - Full Details")
+                print(f"{'='*70}")
+                print(f"Sample ID: {sample.get('decision_point_id', 'N/A')}")
+                print(f"Category: {sample.get('category', 'N/A')}")
+                print(f"Confidence (ground truth): {sample.get('confidence', 'N/A')}")
+                print(f"\n--- AI Agent Role ---")
+                print(f"Target Speaker: {sample.get('target_speaker', 'N/A')}")
+                print(f"All Speakers: {sample.get('all_speakers', [])}")
+                
+                print(f"\n--- Context Turns ({len(sample.get('context_turns', []))} turns) ---")
+                context_turns = sample.get('context_turns', [])
+                if context_turns:
+                    for idx, turn in enumerate(context_turns[-5:], 1):
+                        print(f"  {idx}. Speaker {turn.get('speaker', '?')}: {turn.get('text', '')[:100]}{'...' if len(turn.get('text', '')) > 100 else ''}")
+                    if len(context_turns) > 5:
+                        print(f"  ... ({len(context_turns) - 5} more turns before)")
+                else:
+                    print(f"  (No previous context)")
+                
+                print(f"\n--- Current Turn ---")
+                current_turn = sample.get('current_turn', {})
+                print(f"Speaker: {current_turn.get('speaker', '?')}")
+                print(f"Text: {current_turn.get('text', '')}")
+                
+                print(f"\n--- Decision ---")
+                print(f"Ground Truth: {ground_truth}")
+                print(f"Extracted Prediction: {prediction}")
+                print(f"Match: {'CORRECT' if prediction == ground_truth else 'WRONG'}")
+                
+                print(f"\n--- Model Output ---")
+                print(f"Full output: {output_text}")
+                if '</decision>' in output_text:
+                    decision_end = output_text.find('</decision>')
+                    decision_content = output_text[:decision_end].strip()
+                    print(f"Extracted from: '{decision_content}' → {prediction}")
+                print(f"{'='*70}")
+            
+            context_turns_list = sample.get('context_turns', [])
+            if len(context_turns_list) > MAX_CONTEXT_TURNS_IN_RESULTS:
+                context_turns_display = context_turns_list[-MAX_CONTEXT_TURNS_IN_RESULTS:]
+                context_turns_total = len(context_turns_list)
+            else:
+                context_turns_display = context_turns_list
+                context_turns_total = len(context_turns_list)
+
             all_predictions.append({
-                'sample_id': sample.get('decision_point_id', f'sample_{i}'),
+                'sample_id': sample.get('decision_point_id', f'sample_{i+batch_idx}'),
                 'ground_truth': ground_truth,
                 'prediction': prediction,
                 'category': sample.get('category', 'UNKNOWN'),
-                'output_text': output_text[:200],
-                'latency': latency
+                'output_text': output_text,
+                'latency': latency,
+                'target_speaker': sample.get('target_speaker', 'N/A'),
+                'all_speakers': sample.get('all_speakers', []),
+                'context_turns': context_turns_display,
+                'context_turns_total': context_turns_total,
+                'current_turn': sample.get('current_turn', {}),
+                'confidence': sample.get('confidence', 'N/A'),
             })
             all_latencies.append(latency)
         
         print(f"(avg latency: {np.mean([r[1] for r in batch_results]):.3f}s)")
     
+    print(f"\n[DEBUG] Prediction analysis:")
+    prediction_counts = defaultdict(int)
+    ground_truth_counts = defaultdict(int)
+    none_predictions = 0
+    
+    for p in all_predictions:
+        pred = p['prediction']
+        gt = p['ground_truth']
+        prediction_counts[pred if pred else 'None'] += 1
+        ground_truth_counts[gt] += 1
+        if pred is None:
+            none_predictions += 1
+    
+    print(f"  Total samples: {len(all_predictions)}")
+    if len(all_predictions) == 0:
+        print("  No samples to evaluate. Please check if data files exist.")
+        return {
+            'accuracy': 0.0,
+            'total_samples': 0,
+            'correct': 0,
+            'latency_stats': {},
+            'category_metrics': {},
+            'confusion_matrix': {},
+            'false_positives': 0,
+            'false_negatives': 0,
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+        }
+    
+    print(f"  Predictions distribution:")
+    for pred, count in sorted(prediction_counts.items()):
+        print(f"    {pred}: {count} ({count/len(all_predictions)*100:.1f}%)")
+    print(f"  Ground truth distribution:")
+    for gt, count in sorted(ground_truth_counts.items()):
+        print(f"    {gt}: {count} ({count/len(all_predictions)*100:.1f}%)")
+    print(f"  None predictions (failed extraction): {none_predictions} ({none_predictions/len(all_predictions)*100:.1f}%)")
+    
+    mismatches = [p for p in all_predictions if p['prediction'] != p['ground_truth']]
+    if mismatches:
+        print(f"\n[DEBUG] First 10 mismatches (with full details):")
+        for idx, p in enumerate(mismatches[:10]):
+            print(f"\n{'='*70}")
+            print(f"[MISMATCH {idx+1}] Sample ID: {p['sample_id']}")
+            print(f"{'='*70}")
+            print(f"Category: {p['category']}")
+            print(f"Confidence (ground truth): {p['confidence']}")
+            print(f"\n--- AI Agent Role ---")
+            print(f"Target Speaker: {p['target_speaker']}")
+            print(f"All Speakers: {p['all_speakers']}")
+            
+            total_ctx = p.get('context_turns_total', len(p['context_turns']))
+            suffix = f", {total_ctx} total" if total_ctx > MAX_CONTEXT_TURNS_IN_RESULTS else ""
+            print(f"\n--- Context Turns ({len(p['context_turns'])} turns{suffix}) ---")
+            context_turns = p['context_turns']
+            if context_turns:
+                for turn_idx, turn in enumerate(context_turns[-5:], 1):
+                    print(f"  {turn_idx}. Speaker {turn.get('speaker', '?')}: {turn.get('text', '')[:100]}{'...' if len(turn.get('text', '')) > 100 else ''}")
+                if len(context_turns) > 5:
+                    print(f"  ... ({len(context_turns) - 5} more turns before)")
+            else:
+                print(f"  (No previous context)")
+            
+            print(f"\n--- Current Turn ---")
+            current_turn = p['current_turn']
+            print(f"Speaker: {current_turn.get('speaker', '?')}")
+            print(f"Text: {current_turn.get('text', '')}")
+            
+            print(f"\n--- Decision ---")
+            print(f"Ground Truth: {p['ground_truth']}")
+            print(f"Extracted Prediction: {p['prediction']}")
+            print(f"Match: WRONG")
+            
+            print(f"\n--- Model Output ---")
+            print(f"Full output: {p['output_text']}")
+            if '</decision>' in p['output_text']:
+                decision_end = p['output_text'].find('</decision>')
+                decision_content = p['output_text'][:decision_end].strip()
+                print(f"Extracted from: '{decision_content}' → {p['prediction']}")
+            print(f"{'='*70}")
+    
     correct = sum(1 for p in all_predictions if p['prediction'] == p['ground_truth'])
     accuracy = correct / len(all_predictions) if all_predictions else 0
+    
+    print(f"\n[DEBUG] Accuracy calculation:")
+    print(f"  Correct: {correct}")
+    print(f"  Total: {len(all_predictions)}")
+    print(f"  Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
     
     category_metrics = defaultdict(lambda: {'correct': 0, 'total': 0})
     for pred in all_predictions:
@@ -329,16 +659,27 @@ def evaluate_samples(
         key = f"{pred['ground_truth']}_->_{pred['prediction']}"
         confusion[key] += 1
     
-    latencies = np.array(all_latencies)
-    latency_stats = {
-        'mean': float(np.mean(latencies)),
-        'median': float(np.median(latencies)),
-        'p50': float(np.percentile(latencies, 50)),
-        'p95': float(np.percentile(latencies, 95)),
-        'p99': float(np.percentile(latencies, 99)),
-        'min': float(np.min(latencies)),
-        'max': float(np.max(latencies)),
-    }
+    if len(all_latencies) > 0:
+        latencies = np.array(all_latencies)
+        latency_stats = {
+            'mean': float(np.mean(latencies)),
+            'median': float(np.median(latencies)),
+            'p50': float(np.percentile(latencies, 50)),
+            'p95': float(np.percentile(latencies, 95)),
+            'p99': float(np.percentile(latencies, 99)),
+            'min': float(np.min(latencies)),
+            'max': float(np.max(latencies)),
+        }
+    else:
+        latency_stats = {
+            'mean': 0.0,
+            'median': 0.0,
+            'p50': 0.0,
+            'p95': 0.0,
+            'p99': 0.0,
+            'min': 0.0,
+            'max': 0.0,
+        }
     
     false_positives = sum(1 for p in all_predictions 
                           if p['ground_truth'] == 'SILENT' and p['prediction'] == 'SPEAK')
@@ -368,20 +709,45 @@ def evaluate_samples(
         'latency_stats': latency_stats,
         'false_positive_rate': fpr,
         'false_negative_rate': fnr,
-        'predictions': all_predictions[:100],
+        'predictions': all_predictions,
     }
     
     return results
 
 
 
-def main():
+def main(
+    dataset: str = 'ami',
+    debug_prompts: bool = False,
+    model: Optional[str] = None,
+    system_prompt_repeat: Optional[int] = None,
+):
+    global SYSTEM_PROMPT_REPEAT
+    if system_prompt_repeat is not None:
+        SYSTEM_PROMPT_REPEAT = system_prompt_repeat
+
+    DATA_DIR = BASE_DIR / 'data' / dataset
+    TEST_FILE = DATA_DIR / 'test' / 'test_samples.jsonl'
+    VAL_FILE = DATA_DIR / 'val' / 'val_samples.jsonl'
+    EVAL_FILE = TEST_FILE
+
+    model_key = model if model is not None else DEFAULT_MODEL
+    model_id = MODEL_OPTIONS.get(model_key) or DEFAULT_BASE_MODEL
+    if model_key not in MODEL_OPTIONS:
+        model_key = next((k for k, v in MODEL_OPTIONS.items() if v == model_id), model_key)
+
+    RESULTS_DIR = Path(__file__).parent / 'results'
+    RESULTS_DIR.mkdir(exist_ok=True)
+    sp_suffix = f"_sp{system_prompt_repeat}" if system_prompt_repeat is not None else ""
+    RESULTS_FILE = RESULTS_DIR / f"baseline_results_{dataset}_{model_key}{sp_suffix}.json"
+
     print("="*70)
-    print("BASELINE EVALUATION: QWEN 8B")
+    print(f"BASELINE EVALUATION: {model_key} ({model_id})")
+    print(f"Dataset: {dataset.upper()}")
     print("="*70)
-    
+
     print("\nLoading model...")
-    loader = QwenModelLoader(use_vllm=USE_VLLM)
+    loader = InstructModelLoader(model_id=model_id, use_vllm=USE_VLLM)
     model_result = loader.load()
     model = model_result['model']
     tokenizer = model_result['tokenizer']
@@ -391,8 +757,12 @@ def main():
     samples = load_samples(EVAL_FILE)
     print(f"Loaded {len(samples)} samples")
     
-    results = evaluate_samples(samples, model, tokenizer, use_vllm, BATCH_SIZE)
-    
+    results = evaluate_samples(samples, model, tokenizer, use_vllm, BATCH_SIZE, debug_prompts=debug_prompts, model_id=model_id)
+    results["model_key"] = model_key
+    results["model_id"] = model_id
+    results["dataset"] = dataset
+    results["system_prompt_repeat"] = SYSTEM_PROMPT_REPEAT
+
     print("\n" + "="*70)
     print("EVALUATION RESULTS")
     print("="*70)
@@ -426,4 +796,21 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Evaluate baseline model')
+    parser.add_argument('--dataset', type=str, default='ami',
+                        choices=['ami', 'friends', 'spgi'],
+                        help='Dataset name (default: ami)')
+    parser.add_argument('--model', type=str, default=None,
+                        choices=list(MODEL_OPTIONS.keys()),
+                        help=f'Model key (default: from MODEL env or {DEFAULT_MODEL!r})')
+    parser.add_argument('--debug-prompts', action='store_true',
+                        help='Print full system prompt, instruction, and input for first 3-4 samples')
+    parser.add_argument('--system-prompt-repeat', type=int, default=None, choices=[1, 2],
+                        help='Repeat system prompt 1 or 2 times (default: use module default)')
+    args = parser.parse_args()
+    main(
+        dataset=args.dataset,
+        debug_prompts=args.debug_prompts,
+        model=args.model,
+        system_prompt_repeat=args.system_prompt_repeat,
+    )

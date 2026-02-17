@@ -1,58 +1,65 @@
 #!/usr/bin/env python3
 """
-Generate Final Evaluation Report
-
-Compiles all evaluation results into a comprehensive report.
+Compile evaluation results (baseline, fine-tuned, comparison, category analysis) into one markdown report.
 """
 
+import argparse
 import json
-from pathlib import Path
 from datetime import datetime
-
+from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-RESULTS_DIR = Path(__file__).parent / 'results'
-
-BASELINE_FILE = BASE_DIR / 'benchmarking' / 'results' / 'baseline_results.json'
-FINETUNED_FILE = RESULTS_DIR / 'finetuned_results.json'
-COMPARISON_FILE = RESULTS_DIR / 'baseline_vs_finetuned.json'
-CATEGORY_ANALYSIS_FILE = RESULTS_DIR / 'category_analysis.txt'
-
-REPORT_FILE = RESULTS_DIR / 'final_evaluation_report.md'
+BENCHMARK_RESULTS = BASE_DIR / "benchmarking" / "results"
+RESULTS_DIR = Path(__file__).parent / "results"
 
 
-def load_json_file(file_path: Path) -> dict:
-    if not file_path.exists():
+def load_json_file(file_path: Path):
+    if not file_path or not file_path.exists():
         return None
-    with open(file_path, 'r') as f:
+    with open(file_path, "r") as f:
         return json.load(f)
 
 
-def load_text_file(file_path: Path) -> str:
-    if not file_path.exists():
+def load_text_file(file_path: Path):
+    if not file_path or not file_path.exists():
         return None
-    with open(file_path, 'r') as f:
+    with open(file_path, "r") as f:
         return f.read()
 
 
-def generate_markdown_report() -> str:
+def find_baseline_file(dataset: str, model_key: str) -> Path:
+    for name in [
+        f"baseline_results_{dataset}_{model_key}.json",
+        f"baseline_results_{dataset}_{model_key}_sp1.json",
+        f"baseline_results_{dataset}_{model_key}_sp2.json",
+    ]:
+        p = BENCHMARK_RESULTS / name
+        if p.exists():
+            return p
+    return None
+
+
+def generate_markdown_report(dataset: str, model_key: str) -> str:
+    baseline_file = find_baseline_file(dataset, model_key)
+    finetuned_file = RESULTS_DIR / f"finetuned_results_{dataset}_{model_key}.json"
+    comparison_file = RESULTS_DIR / f"baseline_vs_finetuned_{dataset}_{model_key}.json"
+    category_file = RESULTS_DIR / f"category_analysis_{dataset}_{model_key}.txt"
+
     lines = []
-    
-    # Header
     lines.append("# Context-Aware Turn-Taking Model: Final Evaluation Report")
     lines.append("")
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
+    lines.append(f"Dataset: {dataset} | Model: {model_key}")
+    lines.append("")
     lines.append("---")
     lines.append("")
-    
-    # Load data
-    baseline = load_json_file(BASELINE_FILE)
-    finetuned = load_json_file(FINETUNED_FILE)
-    comparison = load_json_file(COMPARISON_FILE)
-    category_analysis = load_text_file(CATEGORY_ANALYSIS_FILE)
-    
-    # Executive Summary
+
+    baseline = load_json_file(baseline_file)
+    finetuned = load_json_file(finetuned_file)
+    comparison = load_json_file(comparison_file)
+    category_analysis = load_text_file(category_file)
+
     lines.append("## Executive Summary")
     lines.append("")
     if baseline and finetuned:
@@ -68,8 +75,6 @@ def generate_markdown_report() -> str:
     else:
         lines.append("Baseline or fine-tuned results not available.")
         lines.append("")
-    
-    # Baseline Results
     if baseline:
         lines.append("## Baseline Results")
         lines.append("")
@@ -85,8 +90,6 @@ def generate_markdown_report() -> str:
             lines.append(f"- P95: {latency.get('p95', 0):.4f}s")
             lines.append(f"- P99: {latency.get('p99', 0):.4f}s")
             lines.append("")
-    
-    # Fine-Tuned Results
     if finetuned:
         lines.append("## Fine-Tuned Results")
         lines.append("")
@@ -102,8 +105,6 @@ def generate_markdown_report() -> str:
             lines.append(f"- P95: {latency.get('p95', 0):.4f}s")
             lines.append(f"- P99: {latency.get('p99', 0):.4f}s")
             lines.append("")
-    
-    # Comparison
     if comparison:
         lines.append("## Comparison: Baseline vs Fine-Tuned")
         lines.append("")
@@ -117,9 +118,7 @@ def generate_markdown_report() -> str:
         lines.append(f"| FPR | {comp['baseline']['false_positive_rate']:.2%} | {comp['finetuned']['false_positive_rate']:.2%} | {comp['improvements']['fpr_delta']:+.2%} |")
         lines.append(f"| FNR | {comp['baseline']['false_negative_rate']:.2%} | {comp['finetuned']['false_negative_rate']:.2%} | {comp['improvements']['fnr_delta']:+.2%} |")
         lines.append("")
-        
-        # Category comparison
-        if 'category_comparison' in comp:
+        if "category_comparison" in comp:
             lines.append("### Per-Category Comparison")
             lines.append("")
             lines.append("| Category | Baseline | Fine-Tuned | Improvement |")
@@ -129,8 +128,6 @@ def generate_markdown_report() -> str:
                 cat_comp = comp['category_comparison'][cat]
                 lines.append(f"| {cat} | {cat_comp['baseline']:.2%} | {cat_comp['finetuned']:.2%} | {cat_comp['delta']:+.2%} |")
             lines.append("")
-    
-    # Category Analysis
     if category_analysis:
         lines.append("## Detailed Category Analysis")
         lines.append("")
@@ -138,45 +135,38 @@ def generate_markdown_report() -> str:
         lines.append(category_analysis)
         lines.append("```")
         lines.append("")
-    
-    # Files
     lines.append("## Generated Files")
     lines.append("")
-    lines.append("- `baseline_results.json` - Baseline evaluation results")
-    lines.append("- `finetuned_results.json` - Fine-tuned evaluation results")
-    lines.append("- `baseline_vs_finetuned.json` - Comparison data")
-    lines.append("- `category_analysis.txt` - Detailed category breakdown")
-    lines.append("- `final_evaluation_report.md` - This report")
+    lines.append(f"- `finetuned_results_{dataset}_{model_key}.json`")
+    lines.append(f"- `baseline_vs_finetuned_{dataset}_{model_key}.json`")
+    lines.append(f"- `category_analysis_{dataset}_{model_key}.txt`")
+    lines.append(f"- `final_evaluation_report_{dataset}_{model_key}.md`")
     lines.append("")
-    
     return "\n".join(lines)
 
 
-def main():
-    print("="*70)
+def main(dataset: str = "ami", model: str = None):
+    import sys
+    sys.path.insert(0, str(BASE_DIR))
+    from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL
+    model_key = model or DEFAULT_MODEL
+    if model_key not in MODEL_OPTIONS:
+        model_key = DEFAULT_MODEL
+
+    report_file = RESULTS_DIR / f"final_evaluation_report_{dataset}_{model_key}.md"
+    print("=" * 70)
     print("GENERATING FINAL EVALUATION REPORT")
-    print("="*70)
-    
-    print("\nCompiling results...")
-    report = generate_markdown_report()
-    
-    # Save report
-    print(f"\nSaving report to {REPORT_FILE}...")
-    with open(REPORT_FILE, 'w') as f:
+    print("=" * 70)
+    report = generate_markdown_report(dataset, model_key)
+    with open(report_file, "w") as f:
         f.write(report)
-    print("Report saved")
-    
-    # Print summary
-    print("\n" + "="*70)
-    print("REPORT SUMMARY")
-    print("="*70)
-    print("\n" + report[:1000] + "\n...")
-    
-    print("\n" + "="*70)
-    print("REPORT GENERATION COMPLETE")
-    print("="*70)
-    print(f"\nFull report saved to: {REPORT_FILE}")
+    print(f"Report saved to {report_file}")
+    print("\n" + report[:800] + "\n...")
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate final evaluation report")
+    parser.add_argument("--dataset", type=str, default="ami", choices=["ami", "friends", "spgi"])
+    parser.add_argument("--model", type=str, default=None, help="Model key (default: from MODEL env)")
+    args = parser.parse_args()
+    main(dataset=args.dataset, model=args.model)

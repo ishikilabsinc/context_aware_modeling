@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Load Fine-Tuned Model
-
-Loads the fine-tuned LoRA model for evaluation.
+Load fine-tuned LoRA model for evaluation. Uses config for base model and adapter path.
 """
 
 import sys
 from pathlib import Path
 
-# Add project root to path
 project_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project_root))
 
@@ -20,10 +17,6 @@ from fine_tuning.config import BASE_MODEL, FINAL_MODEL_DIR
 
 
 def load_finetuned_model_vllm():
-    """Load fine-tuned model with vLLM for fast inference.
-    
-    Strategy: Use vLLM's native LoRA support without merging (saves disk space).
-    """
     from vllm import LLM
     from transformers import AutoTokenizer
     import os
@@ -93,12 +86,8 @@ def load_finetuned_model_vllm():
     llm._lora_adapter_path = str(FINAL_MODEL_DIR)
     
     print("\nModel loaded successfully with vLLM")
-    print(f"  Model type: {type(llm)}")
     if adapter_name:
         print(f"  LoRA adapter: {adapter_name}")
-    else:
-        print("  Warning: LoRA adapter not loaded - using base model only")
-    
     return llm, tokenizer
 
 
@@ -153,14 +142,9 @@ def load_finetuned_model(use_vllm: bool = True, use_merged: bool = False, merged
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    tokenizer.padding_side = 'left'
-    
+    tokenizer.padding_side = "left"
     print("\nModel loaded successfully")
-    print(f"  Model type: {type(model)}")
-    print(f"  Device: {next(model.parameters()).device}")
-    
     return model, tokenizer
-
 
 
 def main():
