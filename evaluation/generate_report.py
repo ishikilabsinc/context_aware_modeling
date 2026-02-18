@@ -5,10 +5,12 @@ Compile evaluation results (baseline, fine-tuned, comparison, category analysis)
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE_DIR))
 BENCHMARK_RESULTS = BASE_DIR / "benchmarking" / "results"
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -17,7 +19,13 @@ def load_json_file(file_path: Path):
     if not file_path or not file_path.exists():
         return None
     with open(file_path, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    if file_path.name.startswith("baseline_") and "accuracy" not in data:
+        from benchmarking.metrics import compute_metrics
+        predictions = data.get("predictions", [])
+        metrics = compute_metrics(predictions)
+        return {**metrics, "predictions": predictions}
+    return data
 
 
 def load_text_file(file_path: Path):
@@ -29,9 +37,8 @@ def load_text_file(file_path: Path):
 
 def find_baseline_file(dataset: str, model_key: str) -> Path:
     for name in [
-        f"baseline_results_{dataset}_{model_key}.json",
-        f"baseline_results_{dataset}_{model_key}_sp1.json",
-        f"baseline_results_{dataset}_{model_key}_sp2.json",
+        f"baseline_predictions_{dataset}_{model_key}_sp1.json",
+        f"baseline_predictions_{dataset}_{model_key}_sp2.json",
     ]:
         p = BENCHMARK_RESULTS / name
         if p.exists():

@@ -15,14 +15,13 @@ from collections import defaultdict
 import numpy as np
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(BASE_DIR / "benchmarking"))
 sys.path.insert(0, str(BASE_DIR))
 from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL
-from load_finetuned import load_finetuned_model
-from evaluate_baseline import (
+from benchmarking.evaluate_baseline import (
     format_sample_for_inference,
     extract_decision_from_output,
 )
+from evaluation.load_finetuned import load_finetuned_model
 from utils.data_utils import load_samples
 
 USE_VLLM = True
@@ -233,9 +232,8 @@ def evaluate_samples(
 
 def find_baseline_results(baseline_dir: Path, dataset: str, model_key: str) -> Optional[Path]:
     for name in [
-        f"baseline_results_{dataset}_{model_key}.json",
-        f"baseline_results_{dataset}_{model_key}_sp1.json",
-        f"baseline_results_{dataset}_{model_key}_sp2.json",
+        f"baseline_predictions_{dataset}_{model_key}_sp1.json",
+        f"baseline_predictions_{dataset}_{model_key}_sp2.json",
     ]:
         p = baseline_dir / name
         if p.exists():
@@ -244,10 +242,16 @@ def find_baseline_results(baseline_dir: Path, dataset: str, model_key: str) -> O
 
 
 def load_baseline_results(baseline_file: Path) -> Optional[Dict]:
-    if not baseline_file.exists():
+    if not baseline_file or not baseline_file.exists():
         return None
     with open(baseline_file, "r") as f:
-        return json.load(f)
+        data = json.load(f)
+    if "accuracy" in data:
+        return data
+    predictions = data.get("predictions", [])
+    from benchmarking.metrics import compute_metrics
+    metrics = compute_metrics(predictions)
+    return {**metrics, "predictions": predictions}
 
 
 def compare_results(baseline: Dict, finetuned: Dict) -> Dict:

@@ -82,14 +82,16 @@ This runs baseline evaluation for **every** combination of:
 
 Then it writes:
 
+- **Prediction JSONs:** `benchmarking/results/baseline_predictions_<dataset>_<model>_sp<N>.json` (per-sample predictions and run metadata)
 - **Comparison report:** `benchmarking/results/benchmark_comparison.txt` (and `.json`) with accuracy, FPR, FNR, latency per run
-- **Per-run analysis:** `benchmarking/results/baseline_analysis_<dataset>_<model>_sp<N>.txt` for each run
-- **Result JSONs:** `benchmarking/results/baseline_results_<dataset>_<model>_sp<N>.json` (full example details; long context truncated to latest 20 turns)
+- **Per-run analysis:** `benchmarking/results/reports/baseline_analysis_<dataset>_<model>_sp<N>.txt` for each run
+
+Metrics are computed from the prediction files when reports are generated. To change metrics definitions, edit `benchmarking/metrics.py` and re-run reporting only (no need to re-run the model).
 
 Options:
 
 ```bash
-# Only generate reports from existing result files (no evaluation)
+# Regenerate reports from existing prediction files (no model runs; recomputes metrics)
 python benchmarking/run_benchmark.py --skip-run
 
 # Limit scope

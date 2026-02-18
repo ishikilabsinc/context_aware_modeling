@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Baseline evaluation for instruct models on the turn-taking task.
-Model and dataset selectable via CLI or environment (MODEL, DATASET).
-Reports accuracy, latency, and per-category performance.
+Writes prediction-only JSON; metrics are computed via benchmarking.metrics
+Model and dataset via CLI or env (MODEL, DATASET).
 """
 
 import json
@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.constants import SPEAK_CATEGORIES, SILENT_CATEGORIES
 from utils.data_utils import load_samples
 from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL, BASE_MODEL as DEFAULT_BASE_MODEL
+from benchmarking.metrics import compute_metrics, generate_detail_report
 
 # Model / inference configuration
 USE_VLLM = True
@@ -28,11 +29,11 @@ FALLBACK_TO_TRANSFORMERS = True
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 # Inference settings
-BATCH_SIZE = 32 if USE_VLLM else 1
-MAX_NEW_TOKENS = 128
-MAX_NEW_TOKENS_QWEN3 = 192
-TEMPERATURE = 0.0
-STOP_AFTER_DECISION = True
+BATCH_SIZE = 32 if USE_VLLM else 1  # vLLM supports batching, transformers doesn't
+MAX_NEW_TOKENS = 128 # Limit generation for fast inference
+MAX_NEW_TOKENS_QWEN3 = 192 # Qwen3 models have longer context windows
+TEMPERATURE = 0.0 # No temperature for deterministic decisions
+STOP_AFTER_DECISION = True # Stop after the decision is made to save time
 
 # In saved results, show at most this many context turns per example (latest w.r.t current turn)
 MAX_CONTEXT_TURNS_IN_RESULTS = 20
@@ -574,20 +575,8 @@ def evaluate_samples(
     print(f"  Total samples: {len(all_predictions)}")
     if len(all_predictions) == 0:
         print("  No samples to evaluate. Please check if data files exist.")
-        return {
-            'accuracy': 0.0,
-            'total_samples': 0,
-            'correct': 0,
-            'latency_stats': {},
-            'category_metrics': {},
-            'confusion_matrix': {},
-            'false_positives': 0,
-            'false_negatives': 0,
-            'precision': 0.0,
-            'recall': 0.0,
-            'f1': 0.0,
-        }
-    
+        return []
+
     print(f"  Predictions distribution:")
     for pred, count in sorted(prediction_counts.items()):
         print(f"    {pred}: {count} ({count/len(all_predictions)*100:.1f}%)")
@@ -638,81 +627,8 @@ def evaluate_samples(
                 decision_content = p['output_text'][:decision_end].strip()
                 print(f"Extracted from: '{decision_content}' → {p['prediction']}")
             print(f"{'='*70}")
-    
-    correct = sum(1 for p in all_predictions if p['prediction'] == p['ground_truth'])
-    accuracy = correct / len(all_predictions) if all_predictions else 0
-    
-    print(f"\n[DEBUG] Accuracy calculation:")
-    print(f"  Correct: {correct}")
-    print(f"  Total: {len(all_predictions)}")
-    print(f"  Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
-    
-    category_metrics = defaultdict(lambda: {'correct': 0, 'total': 0})
-    for pred in all_predictions:
-        cat = pred['category']
-        category_metrics[cat]['total'] += 1
-        if pred['prediction'] == pred['ground_truth']:
-            category_metrics[cat]['correct'] += 1
-    
-    confusion = defaultdict(int)
-    for pred in all_predictions:
-        key = f"{pred['ground_truth']}_->_{pred['prediction']}"
-        confusion[key] += 1
-    
-    if len(all_latencies) > 0:
-        latencies = np.array(all_latencies)
-        latency_stats = {
-            'mean': float(np.mean(latencies)),
-            'median': float(np.median(latencies)),
-            'p50': float(np.percentile(latencies, 50)),
-            'p95': float(np.percentile(latencies, 95)),
-            'p99': float(np.percentile(latencies, 99)),
-            'min': float(np.min(latencies)),
-            'max': float(np.max(latencies)),
-        }
-    else:
-        latency_stats = {
-            'mean': 0.0,
-            'median': 0.0,
-            'p50': 0.0,
-            'p95': 0.0,
-            'p99': 0.0,
-            'min': 0.0,
-            'max': 0.0,
-        }
-    
-    false_positives = sum(1 for p in all_predictions 
-                          if p['ground_truth'] == 'SILENT' and p['prediction'] == 'SPEAK')
-    false_negatives = sum(1 for p in all_predictions 
-                          if p['ground_truth'] == 'SPEAK' and p['prediction'] == 'SILENT')
-    
-    total_silent = sum(1 for p in all_predictions if p['ground_truth'] == 'SILENT')
-    total_speak = sum(1 for p in all_predictions if p['ground_truth'] == 'SPEAK')
-    
-    fpr = false_positives / total_silent if total_silent > 0 else 0
-    fnr = false_negatives / total_speak if total_speak > 0 else 0
-    
-    results = {
-        'total_samples': len(all_predictions),
-        'accuracy': accuracy,
-        'correct': correct,
-        'incorrect': len(all_predictions) - correct,
-        'category_accuracy': {
-            cat: {
-                'accuracy': metrics['correct'] / metrics['total'] if metrics['total'] > 0 else 0,
-                'correct': metrics['correct'],
-                'total': metrics['total']
-            }
-            for cat, metrics in category_metrics.items()
-        },
-        'confusion_matrix': dict(confusion),
-        'latency_stats': latency_stats,
-        'false_positive_rate': fpr,
-        'false_negative_rate': fnr,
-        'predictions': all_predictions,
-    }
-    
-    return results
+
+    return all_predictions
 
 
 
@@ -737,9 +653,12 @@ def main(
         model_key = next((k for k, v in MODEL_OPTIONS.items() if v == model_id), model_key)
 
     RESULTS_DIR = Path(__file__).parent / 'results'
+    REPORTS_DIR = RESULTS_DIR / 'reports'
     RESULTS_DIR.mkdir(exist_ok=True)
-    sp_suffix = f"_sp{system_prompt_repeat}" if system_prompt_repeat is not None else ""
-    RESULTS_FILE = RESULTS_DIR / f"baseline_results_{dataset}_{model_key}{sp_suffix}.json"
+    REPORTS_DIR.mkdir(exist_ok=True)
+    sp_val = system_prompt_repeat if system_prompt_repeat is not None else SYSTEM_PROMPT_REPEAT
+    sp_suffix = f"_sp{sp_val}"
+    PREDICTIONS_FILE = RESULTS_DIR / f"baseline_predictions_{dataset}_{model_key}{sp_suffix}.json"
 
     print("="*70)
     print(f"BASELINE EVALUATION: {model_key} ({model_id})")
@@ -752,47 +671,61 @@ def main(
     model = model_result['model']
     tokenizer = model_result['tokenizer']
     use_vllm = model_result['use_vllm']
-    
+
     print(f"\nLoading samples from {EVAL_FILE}...")
     samples = load_samples(EVAL_FILE)
     print(f"Loaded {len(samples)} samples")
-    
-    results = evaluate_samples(samples, model, tokenizer, use_vllm, BATCH_SIZE, debug_prompts=debug_prompts, model_id=model_id)
-    results["model_key"] = model_key
-    results["model_id"] = model_id
-    results["dataset"] = dataset
-    results["system_prompt_repeat"] = SYSTEM_PROMPT_REPEAT
 
+    all_predictions = evaluate_samples(
+        samples, model, tokenizer, use_vllm, BATCH_SIZE,
+        debug_prompts=debug_prompts, model_id=model_id,
+    )
+
+    payload = {
+        "dataset": dataset,
+        "model_key": model_key,
+        "model_id": model_id,
+        "system_prompt_repeat": sp_val,
+        "predictions": all_predictions,
+    }
+    print(f"\nSaving predictions to {PREDICTIONS_FILE}...")
+    with open(PREDICTIONS_FILE, "w") as f:
+        json.dump(payload, f, indent=2)
+    print("Predictions saved.")
+
+    metrics = compute_metrics(all_predictions)
     print("\n" + "="*70)
     print("EVALUATION RESULTS")
     print("="*70)
-    print(f"\nTotal samples: {results['total_samples']:,}")
-    print(f"Accuracy: {results['accuracy']:.2%}")
-    print(f"Correct: {results['correct']:,}")
-    print(f"Incorrect: {results['incorrect']:,}")
-    
-    print(f"\nFalse Positive Rate (SILENT -> SPEAK): {results['false_positive_rate']:.2%}")
-    print(f"False Negative Rate (SPEAK -> SILENT): {results['false_negative_rate']:.2%}")
-    
+    print(f"\nTotal samples: {metrics['total_samples']:,}")
+    print(f"Accuracy: {metrics['accuracy']:.2%}")
+    print(f"Macro accuracy: {metrics.get('macro_accuracy', 0):.2%}")
+    print(f"Correct: {metrics['correct']:,}")
+    print(f"Incorrect: {metrics['incorrect']:,}")
+    print(f"\nSpeak  P/R/F1: {metrics.get('precision_speak', 0):.2%} / {metrics.get('recall_speak', 0):.2%} / {metrics.get('f1_speak', 0):.2%}")
+    print(f"Silent P/R/F1: {metrics.get('precision_silent', 0):.2%} / {metrics.get('recall_silent', 0):.2%} / {metrics.get('f1_silent', 0):.2%}")
+    print(f"Macro F1: {metrics.get('macro_f1', 0):.2%}")
+    print(f"\nFalse Positive Rate (SILENT -> SPEAK): {metrics['false_positive_rate']:.2%}")
+    print(f"False Negative Rate (SPEAK -> SILENT): {metrics['false_negative_rate']:.2%}")
     print(f"\nLatency Statistics:")
-    for stat, value in results['latency_stats'].items():
+    for stat, value in metrics['latency_stats'].items():
         print(f"  {stat}: {value:.4f}s")
-    
     print(f"\nPer-Category Accuracy:")
-    for cat in sorted(results['category_accuracy'].keys()):
-        metrics = results['category_accuracy'][cat]
-        print(f"  {cat}: {metrics['accuracy']:.2%} ({metrics['correct']}/{metrics['total']})")
-    
-    print(f"\nSaving results to {RESULTS_FILE}...")
-    with open(RESULTS_FILE, 'w') as f:
-        json.dump(results, f, indent=2)
-    print("Results saved")
-    
+    for cat in sorted(metrics.get('category_accuracy', {}).keys()):
+        m = metrics['category_accuracy'][cat]
+        print(f"  {cat}: {m['accuracy']:.2%} ({m['correct']}/{m['total']})")
+
+    report = generate_detail_report({**metrics, "predictions": all_predictions})
+    report_path = REPORTS_DIR / f"baseline_analysis_{dataset}_{model_key}_sp{sp_val}.txt"
+    with open(report_path, "w") as f:
+        f.write(report)
+    print(f"\nReport saved to {report_path}")
+
     print("\n" + "="*70)
     print("BASELINE EVALUATION COMPLETE")
     print("="*70)
-    
-    return results
+
+    return payload
 
 
 if __name__ == '__main__':
