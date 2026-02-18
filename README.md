@@ -82,11 +82,12 @@ This runs baseline evaluation for **every** combination of:
 
 Then it writes:
 
-- **Prediction JSONs:** `benchmarking/results/baseline_predictions_<dataset>_<model>_sp<N>.json` (per-sample predictions and run metadata)
-- **Comparison report:** `benchmarking/results/benchmark_comparison.txt` (and `.json`) with accuracy, FPR, FNR, latency per run
-- **Per-run analysis:** `benchmarking/results/reports/baseline_analysis_<dataset>_<model>_sp<N>.txt` for each run
+- **Prediction JSONs:** `benchmarking/results/baseline_predictions_<dataset>_<model>_sp<N>.json` — per-sample predictions and run metadata only; no metrics.
+- **Comparison report:** `benchmarking/results/reports/benchmark_comparison.txt` and `benchmarking/results/benchmark_comparison.json` — one row per (dataset, model, SP) with Acc, MacroAcc, MacroF1, FPR, FNR, latency mean, N, nulls; the JSON includes the full set (precision/recall/F1 for Speak and Silent, etc.).
+- **Per-run analysis:** `benchmarking/results/reports/baseline_analysis_<dataset>_<model>_sp<N>.txt` — overall metrics, precision/recall/F1, error rates, latency stats, per-category accuracy, confusion matrix, error analysis.
+- **Category tables:** `benchmarking/results/reports/category_table_<dataset>.txt` — tabular overall metrics and per-category accuracy grid for that dataset.
 
-Metrics are computed from the prediction files when reports are generated. To change metrics definitions, edit `benchmarking/metrics.py` and re-run reporting only (no need to re-run the model).
+Metrics are computed from the prediction files when reports are generated. To change metric definitions, edit `benchmarking/metrics.py` and re-run reporting only (`--skip-run`).
 
 Options:
 
@@ -143,9 +144,10 @@ python evaluation/evaluate_finetuned.py
 
 ## Metrics
 
-- **Classification:** Accuracy (SPEAK vs SILENT), per-category (e.g. I1–I3, S1–S5), confusion matrix.
+- **Classification:** Accuracy, macro accuracy (class-balanced), per-category (I1–I3, S1–S5), confusion matrix.
+- **Precision / recall / F1:** Speak and Silent precision, recall, and F1; macro F1 (SPEAK = positive class).
 - **Rates:** False positive (SILENT→SPEAK), false negative (SPEAK→SILENT).
-- **Latency:** Mean, p50, p95, p99 (reported in baseline and evaluation).
+- **Latency:** Mean, median, p50, p95, p99, min, max (reported in baseline and evaluation).
 
 ---
 
