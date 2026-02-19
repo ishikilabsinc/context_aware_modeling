@@ -30,8 +30,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 
 # Inference settings
 BATCH_SIZE = 32 if USE_VLLM else 1  # vLLM supports batching, transformers doesn't
-MAX_NEW_TOKENS = 128 # Limit generation for fast inference
-MAX_NEW_TOKENS_QWEN3 = 192 # Qwen3 models have longer context windows
+MAX_NEW_TOKENS = 256  # Same for all models (fair comparison)
 TEMPERATURE = 0.0 # No temperature for deterministic decisions
 STOP_AFTER_DECISION = True # Stop after the decision is made to save time
 
@@ -85,6 +84,7 @@ SYSTEM_PROMPT = """
         <confidence>high, medium, or low</confidence>
 
     CRITICAL: The <decision> tag must contain ONLY the single word SPEAK or SILENT. Nothing else.
+    Do not summarize or repeat the conversation. Output only: one sentence in <reasoning>, then <decision>SPEAK or SILENT</decision>, then <confidence>.
 
     EXAMPLES:
 
@@ -153,13 +153,14 @@ class InstructModelLoader:
         print("Loading model with vLLM...")
         print(f"Model: {self.model_id}")
 
+        gpu_mem = 0.85 if self.model_id in ("Qwen/Qwen3-8B", "meta-llama/Llama-3.1-8B-Instruct") else 0.75
         hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
         llm = LLM(
             model=self.model_id,
             dtype="bfloat16",
             tensor_parallel_size=1,
-            max_model_len=16384,
-            gpu_memory_utilization=0.85,
+            max_model_len=18400,
+            gpu_memory_utilization=gpu_mem,
             max_num_seqs=128,
             trust_remote_code=True,
         )
@@ -233,7 +234,7 @@ def format_sample_for_inference(sample: Dict) -> str:
 <|context|>{context_str}<|/context|>
 <|current|>MOST RECENT UTTERANCE (the previous utterance that just occurred): {current_str}<|/current|>
 Reply with your decision in this exact format: <reasoning>One sentence: ACTIVE PARTICIPANT or BYSTANDER, and who is addressed.</reasoning> <decision>SPEAK</decision> or <decision>SILENT</decision> <confidence>high</confidence> or <confidence>medium</confidence> or <confidence>low</confidence>
-<decision>"""
+<reasoning>"""
 
     return prompt
 
@@ -244,11 +245,15 @@ def is_qwen3(model_id: str) -> bool:
 
 
 def get_max_new_tokens(model_id: Optional[str] = None) -> int:
-    return MAX_NEW_TOKENS_QWEN3 if model_id and is_qwen3(model_id) else MAX_NEW_TOKENS
+    return MAX_NEW_TOKENS
 
 
-def format_sample_for_qwen3(sample: Dict, tokenizer) -> str:
-    """Build prompt using chat template with enable_thinking=False."""
+def _build_system_and_user_content(sample: Dict) -> Tuple[str, str]:
+    """
+    Build the canonical system and user message content used for all models.
+    Same content for every model family to keep evaluation fair (no model favored).
+    """
+    system_content = _get_system_prompt_content()
     context_turns = sample.get('context_turns', [])
     current_turn = sample.get('current_turn', {})
 
@@ -280,10 +285,15 @@ CONVERSATION CONTEXT:
 MOST RECENT UTTERANCE (the previous utterance that just occurred): {current_str}
 
 Reply with your decision in this exact format: <reasoning>One sentence: ACTIVE PARTICIPANT or BYSTANDER, and who is addressed.</reasoning> <decision>SPEAK</decision> or <decision>SILENT</decision> <confidence>high</confidence> or <confidence>medium</confidence> or <confidence>low</confidence>"""
+    return system_content, user_content.strip()
 
+
+def format_sample_for_qwen3(sample: Dict, tokenizer) -> str:
+    """Build prompt using Qwen3 chat template with enable_thinking=False."""
+    system_content, user_content = _build_system_and_user_content(sample)
     messages = [
-        {"role": "system", "content": _get_system_prompt_content()},
-        {"role": "user", "content": user_content.strip()},
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
     ]
     try:
         prompt = tokenizer.apply_chat_template(
@@ -294,7 +304,39 @@ Reply with your decision in this exact format: <reasoning>One sentence: ACTIVE P
         )
     except TypeError:
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return prompt
+    return prompt + "\n<reasoning>"
+
+
+# Model IDs (HuggingFace) that use the generic chat template with the same system/user content.
+# Ensures fair comparison: identical prompt content, only tokenization differs per model.
+CHAT_TEMPLATE_MODEL_IDS = frozenset({
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "openai/gpt-oss-20b",
+    "mistralai/Mistral-7B-Instruct-v0.3",
+})
+
+
+def _uses_generic_chat_template(model_id: Optional[str]) -> bool:
+    """True if model should use generic chat template (same content as Qwen3, different tokenization)."""
+    return bool(model_id and model_id in CHAT_TEMPLATE_MODEL_IDS)
+
+
+def format_sample_for_chat_template(sample: Dict, tokenizer) -> str:
+    """
+    Build prompt using the tokenizer's chat template with canonical system/user content.
+    Same content as format_sample_for_qwen3 for fair comparison; no model-specific prompt changes.
+    """
+    system_content, user_content = _build_system_and_user_content(sample)
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    return prompt + "\n<reasoning>"
 
 
 def extract_decision_from_output(text: str) -> Optional[str]:
@@ -338,14 +380,11 @@ def extract_decision_from_output(text: str) -> Optional[str]:
 def infer_with_vllm(model, tokenizer, prompts: List[str], model_id: Optional[str] = None) -> List[Tuple[str, float]]:
     from vllm import SamplingParams
 
-    stop = None
-    if model_id and is_qwen3(model_id):
-        stop = ["<|end_of_turn|>", "<|start_of_turn|>", "<|im_end|>"]
     max_tokens = get_max_new_tokens(model_id)
     sampling_params = SamplingParams(
         temperature=TEMPERATURE,
         max_tokens=max_tokens,
-        stop=stop,
+        stop=None,
     )
     
     start_time = time.time()
@@ -420,6 +459,9 @@ def evaluate_samples(
     if model_id and is_qwen3(model_id):
         prompts = [format_sample_for_qwen3(sample, tokenizer) for sample in samples]
         print("Using chat template (enable_thinking=False)")
+    elif model_id and _uses_generic_chat_template(model_id):
+        prompts = [format_sample_for_chat_template(sample, tokenizer) for sample in samples]
+        print("Using generic chat template (same prompt content as other models)")
     else:
         prompts = [format_sample_for_inference(sample) for sample in samples]
     

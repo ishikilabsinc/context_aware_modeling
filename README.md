@@ -5,7 +5,7 @@ This repository trains and evaluates language models for **context-aware turn-ta
 ## Overview
 
 - **Task:** Given conversation history and the most recent utterance, predict if the target speaker should take the turn (SPEAK) or remain silent (SILENT).
-- **Models:** Qwen family (Qwen2.5-7B, Qwen3-4B-Instruct, Qwen3-8B). Baseline evaluation and LoRA fine-tuning.
+- **Models:** Qwen (Qwen2.5-7B, Qwen3-4B-Instruct, Qwen3-8B), Llama 3.1-8B-Instruct, GPT-OSS-20B, Mistral-7B-Instruct. Baseline evaluation and LoRA fine-tuning.
 - **Datasets:** AMI, Friends, SPGI (each with train/val/test splits).
 - **Pipeline:** Prepare data → Validate (optional) → Run benchmark (all baselines) or single-run eval → Fine-tune (optional) → Evaluate fine-tuned.
 
@@ -76,7 +76,7 @@ python benchmarking/run_benchmark.py
 
 This runs baseline evaluation for **every** combination of:
 
-- **Models:** `qwen2.5-7b` | `qwen3-4b-instruct` | `qwen3-8b`
+- **Models:** `qwen2.5-7b` | `qwen3-4b-instruct` | `qwen3-8b` | `llama3.1-8b-instruct` | `gpt-oss-20b` | `mistral-7b-instruct`
 - **Datasets:** those with a test split (e.g. ami, friends, spgi after prepare_data)
 - **System prompt repeat:** 1 and 2
 
@@ -137,7 +137,7 @@ python evaluation/evaluate_finetuned.py
 ## Configuration
 
 - **Dataset:** `DATASET` env or `--dataset` (ami | friends | spgi). Used by prepare_data, validate_data, evaluate_baseline, fine_tuning, evaluation.
-- **Model:** `MODEL` env or `--model` in benchmarking (qwen2.5-7b | qwen3-4b-instruct | qwen3-8b). Defined in `fine_tuning/config.py`; benchmarking and evaluation read the same options. If you set `MODEL`, it must be one of these keys or the process will raise at import (e.g. when starting run_benchmark or train_lora). Omit `MODEL` to use the default (qwen2.5-7b).
+- **Model:** `MODEL` env or `--model` in benchmarking (qwen2.5-7b | qwen3-4b-instruct | qwen3-8b | llama3.1-8b-instruct | gpt-oss-20b | mistral-7b-instruct). Defined in `fine_tuning/config.py`; benchmarking and evaluation read the same options. If you set `MODEL`, it must be one of these keys or the process will raise at import (e.g. when starting run_benchmark or train_lora). Omit `MODEL` to use the default (qwen2.5-7b).
 - **System prompt:** Single `SYSTEM_PROMPT` in `benchmarking/evaluate_baseline.py`; repeated 1 or 2 times via `--system-prompt-repeat` (run_benchmark runs both).
 
 ---

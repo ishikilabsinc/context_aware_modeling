@@ -12,6 +12,9 @@ MODEL_OPTIONS = {
     "qwen2.5-7b": "Qwen/Qwen2.5-7B-Instruct",
     "qwen3-4b-instruct": "Qwen/Qwen3-4B-Instruct-2507",
     "qwen3-8b": "Qwen/Qwen3-8B",
+    "llama3.1-8b-instruct": "meta-llama/Llama-3.1-8B-Instruct",
+    "gpt-oss-20b": "openai/gpt-oss-20b",
+    "mistral-7b-instruct": "mistralai/Mistral-7B-Instruct-v0.3",
 }
 
 _MODEL_KEY = os.environ.get("MODEL", "qwen2.5-7b").strip().lower()
