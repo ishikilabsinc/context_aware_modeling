@@ -13,11 +13,10 @@ import os
 import argparse
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-from collections import Counter, defaultdict
+from collections import defaultdict
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from utils.constants import SPEAK_CATEGORIES, SILENT_CATEGORIES
 from utils.data_utils import load_samples
 from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL, BASE_MODEL as DEFAULT_BASE_MODEL
 from benchmarking.metrics import compute_metrics, generate_detail_report

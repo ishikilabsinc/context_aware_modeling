@@ -298,7 +298,12 @@ def compare_results(baseline: Dict, finetuned: Dict) -> Dict:
 
 
 
-def main(dataset: str = "ami", model: Optional[str] = None):
+def main(
+    dataset: str = "ami",
+    model: Optional[str] = None,
+    checkpoint: Optional[str] = None,
+    lora_rank: Optional[int] = None,
+):
     model_key = model if model is not None else DEFAULT_MODEL
     if model_key not in MODEL_OPTIONS:
         model_key = next((k for k in MODEL_OPTIONS.keys() if k == model_key), DEFAULT_MODEL)
@@ -307,18 +312,33 @@ def main(dataset: str = "ami", model: Optional[str] = None):
     TEST_FILE = DATA_DIR / "test" / "test_samples.jsonl"
     EVAL_FILE = TEST_FILE
 
+    # Checkpoints dir: use <model>_r<N> when trained with --lora-rank N
+    checkpoint_name = (checkpoint or "final").strip().lower()
+    run_dir_name = f"{model_key}_r{lora_rank}" if lora_rank is not None else model_key
+    checkpoints_dir = BASE_DIR / "fine_tuning" / "checkpoints" / run_dir_name
+    if checkpoint_name == "final":
+        adapter_path = checkpoints_dir / "final_model"
+    else:
+        adapter_path = checkpoints_dir / checkpoint_name
+
     RESULTS_DIR = Path(__file__).parent / "results"
     RESULTS_DIR.mkdir(exist_ok=True)
-    RESULTS_FILE = RESULTS_DIR / f"finetuned_results_{dataset}_{model_key}.json"
-    COMPARISON_FILE = RESULTS_DIR / f"baseline_vs_finetuned_{dataset}_{model_key}.json"
+    suffix = "" if checkpoint_name == "final" else f"_{checkpoint_name}"
+    if lora_rank is not None:
+        suffix = f"_r{lora_rank}{suffix}"
+    RESULTS_FILE = RESULTS_DIR / f"finetuned_results_{dataset}_{model_key}{suffix}.json"
+    COMPARISON_FILE = RESULTS_DIR / f"baseline_vs_finetuned_{dataset}_{model_key}{suffix}.json"
 
     print("=" * 70)
     print(f"EVALUATING FINE-TUNED MODEL: {model_key}")
     print(f"Dataset: {dataset.upper()}")
+    print(f"Checkpoint: {checkpoint_name}")
+    if lora_rank is not None:
+        print(f"LoRA rank run: r{lora_rank}")
     print("=" * 70)
 
     print("\nLoading fine-tuned model...")
-    model_obj, tokenizer = load_finetuned_model(use_vllm=USE_VLLM)
+    model_obj, tokenizer = load_finetuned_model(use_vllm=USE_VLLM, adapter_path=adapter_path)
 
     print(f"\nLoading samples from {EVAL_FILE}...")
     samples = load_samples(EVAL_FILE)
@@ -409,6 +429,19 @@ if __name__ == "__main__":
         choices=list(MODEL_OPTIONS.keys()),
         help="Model key (default: from MODEL env or config)",
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint to evaluate: 'final' (default) or e.g. 'checkpoint-2000', 'checkpoint-4000'. Use to see if the needle moves after the first checkpoint.",
+    )
+    parser.add_argument(
+        "--lora-rank",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Evaluate a run trained with --lora-rank N (loads from checkpoints/<model>_r<N>/).",
+    )
     args = parser.parse_args()
     dataset = args.dataset or os.environ.get("DATASET", "ami")
-    main(dataset=dataset, model=args.model)
+    main(dataset=dataset, model=args.model, checkpoint=args.checkpoint, lora_rank=args.lora_rank)

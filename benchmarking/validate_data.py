@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
-from utils.constants import SPEAK_CATEGORIES, SILENT_CATEGORIES, ALL_CATEGORIES
+from utils.constants import CATEGORY_NAMES
 from utils.data_utils import load_samples
 
 REQUIRED_SECTIONS = ['system', 'instruction', 'context', 'current']
@@ -153,27 +153,11 @@ def print_statistics(stats: Dict, dataset_name: str = "Dataset"):
     if stats['categories']:
         print(f"\nCategory distribution:")
         total_categories = sum(stats['categories'].values())
-        speak_cats = {k: v for k, v in stats['categories'].items() if k in SPEAK_CATEGORIES}
-        silent_cats = {k: v for k, v in stats['categories'].items() if k in SILENT_CATEGORIES}
-        
-        if speak_cats:
-            print(f"  SPEAK categories:")
-            for cat in SPEAK_CATEGORIES:
-                count = speak_cats.get(cat, 0)
-                pct = (count / total_categories * 100) if total_categories > 0 else 0
-                print(f"    {cat}: {count:,} ({pct:.1f}%)")
-        
-        if silent_cats:
-            print(f"  SILENT categories:")
-            for cat in SILENT_CATEGORIES:
-                count = silent_cats.get(cat, 0)
-                pct = (count / total_categories * 100) if total_categories > 0 else 0
-                print(f"    {cat}: {count:,} ({pct:.1f}%)")
-        
-        unknown = stats['categories'].get('UNKNOWN', 0)
-        if unknown > 0:
-            pct = (unknown / total_categories * 100) if total_categories > 0 else 0
-            print(f"    UNKNOWN: {unknown:,} ({pct:.1f}%)")
+        for cat in sorted(stats['categories'].keys()):
+            count = stats['categories'][cat]
+            pct = (count / total_categories * 100) if total_categories > 0 else 0
+            label = CATEGORY_NAMES.get(cat, cat)
+            print(f"  {cat} ({label}): {count:,} ({pct:.1f}%)")
     if stats['confidence_levels']:
         print(f"\nConfidence distribution:")
         total_conf = sum(stats['confidence_levels'].values())

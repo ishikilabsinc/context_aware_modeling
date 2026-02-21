@@ -46,18 +46,21 @@ def find_baseline_file(dataset: str, model_key: str) -> Path:
     return None
 
 
-def generate_markdown_report(dataset: str, model_key: str) -> str:
+def generate_markdown_report(dataset: str, model_key: str, suffix: str = "") -> str:
     baseline_file = find_baseline_file(dataset, model_key)
-    finetuned_file = RESULTS_DIR / f"finetuned_results_{dataset}_{model_key}.json"
-    comparison_file = RESULTS_DIR / f"baseline_vs_finetuned_{dataset}_{model_key}.json"
-    category_file = RESULTS_DIR / f"category_analysis_{dataset}_{model_key}.txt"
+    finetuned_file = RESULTS_DIR / f"finetuned_results_{dataset}_{model_key}{suffix}.json"
+    comparison_file = RESULTS_DIR / f"baseline_vs_finetuned_{dataset}_{model_key}{suffix}.json"
+    category_file = RESULTS_DIR / f"category_analysis_{dataset}_{model_key}{suffix}.txt"
 
     lines = []
     lines.append("# Context-Aware Turn-Taking Model: Final Evaluation Report")
     lines.append("")
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
-    lines.append(f"Dataset: {dataset} | Model: {model_key}")
+    header = f"Dataset: {dataset} | Model: {model_key}"
+    if suffix:
+        header += f" | Run: {suffix.lstrip('_')}"
+    lines.append(header)
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -144,15 +147,15 @@ def generate_markdown_report(dataset: str, model_key: str) -> str:
         lines.append("")
     lines.append("## Generated Files")
     lines.append("")
-    lines.append(f"- `finetuned_results_{dataset}_{model_key}.json`")
-    lines.append(f"- `baseline_vs_finetuned_{dataset}_{model_key}.json`")
-    lines.append(f"- `category_analysis_{dataset}_{model_key}.txt`")
-    lines.append(f"- `final_evaluation_report_{dataset}_{model_key}.md`")
+    lines.append(f"- `finetuned_results_{dataset}_{model_key}{suffix}.json`")
+    lines.append(f"- `baseline_vs_finetuned_{dataset}_{model_key}{suffix}.json`")
+    lines.append(f"- `category_analysis_{dataset}_{model_key}{suffix}.txt`")
+    lines.append(f"- `final_evaluation_report_{dataset}_{model_key}{suffix}.md`")
     lines.append("")
     return "\n".join(lines)
 
 
-def main(dataset: str = "ami", model: str = None):
+def main(dataset: str = "ami", model: str = None, suffix: str = ""):
     import sys
     sys.path.insert(0, str(BASE_DIR))
     from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL
@@ -160,11 +163,11 @@ def main(dataset: str = "ami", model: str = None):
     if model_key not in MODEL_OPTIONS:
         model_key = DEFAULT_MODEL
 
-    report_file = RESULTS_DIR / f"final_evaluation_report_{dataset}_{model_key}.md"
+    report_file = RESULTS_DIR / f"final_evaluation_report_{dataset}_{model_key}{suffix}.md"
     print("=" * 70)
     print("GENERATING FINAL EVALUATION REPORT")
     print("=" * 70)
-    report = generate_markdown_report(dataset, model_key)
+    report = generate_markdown_report(dataset, model_key, suffix)
     with open(report_file, "w") as f:
         f.write(report)
     print(f"Report saved to {report_file}")
@@ -175,5 +178,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate final evaluation report")
     parser.add_argument("--dataset", type=str, default="ami", choices=["ami", "friends", "spgi"])
     parser.add_argument("--model", type=str, default=None, help="Model key (default: from MODEL env)")
+    parser.add_argument("--suffix", type=str, default="", help="Filename suffix for run (e.g. _r32, _checkpoint-2000); must match evaluate_finetuned.py output")
     args = parser.parse_args()
-    main(dataset=args.dataset, model=args.model)
+    main(dataset=args.dataset, model=args.model, suffix=args.suffix)

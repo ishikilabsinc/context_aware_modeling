@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Load fine-tuned LoRA model for evaluation. Uses config for base model and adapter path.
+Supports loading a specific checkpoint (e.g. checkpoint-2000) via adapter_path.
 """
 
 import sys
 from pathlib import Path
+from typing import Optional
 
 project_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project_root))
@@ -16,19 +18,20 @@ from peft import PeftModel
 from fine_tuning.config import BASE_MODEL, FINAL_MODEL_DIR
 
 
-def load_finetuned_model_vllm():
+def load_finetuned_model_vllm(adapter_path: Optional[Path] = None):
     from vllm import LLM
     from transformers import AutoTokenizer
     import os
     
+    adapter_dir = adapter_path if adapter_path is not None else FINAL_MODEL_DIR
     print("\nLoading fine-tuned model with vLLM...")
     print(f"Base model: {BASE_MODEL}")
-    print(f"LoRA adapters: {FINAL_MODEL_DIR}")
+    print(f"LoRA adapters: {adapter_dir}")
     
-    if not FINAL_MODEL_DIR.exists():
+    if not adapter_dir.exists():
         raise FileNotFoundError(
-            f"Fine-tuned model not found at {FINAL_MODEL_DIR}. "
-            "Please run fine_tuning/train_lora.py first."
+            f"Fine-tuned model not found at {adapter_dir}. "
+            "Please run fine_tuning/train_lora.py first or use --checkpoint <name> for a saved checkpoint (e.g. checkpoint-2000)."
         )
     
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
@@ -52,11 +55,11 @@ def load_finetuned_model_vllm():
     
     try:
         if hasattr(llm, 'llm_engine') and hasattr(llm.llm_engine, 'add_lora'):
-            llm.llm_engine.add_lora(adapter_name, str(FINAL_MODEL_DIR))
+            llm.llm_engine.add_lora(adapter_name, str(adapter_dir))
             lora_loaded = True
             print(f"LoRA adapter '{adapter_name}' loaded successfully via llm_engine.add_lora")
         elif hasattr(llm, 'add_lora'):
-            llm.add_lora(adapter_name, str(FINAL_MODEL_DIR))
+            llm.add_lora(adapter_name, str(adapter_dir))
             lora_loaded = True
             print(f"LoRA adapter '{adapter_name}' loaded successfully via add_lora")
         else:
@@ -83,7 +86,7 @@ def load_finetuned_model_vllm():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     llm._lora_adapter_name = adapter_name
-    llm._lora_adapter_path = str(FINAL_MODEL_DIR)
+    llm._lora_adapter_path = str(adapter_dir)
     
     print("\nModel loaded successfully with vLLM")
     if adapter_name:
@@ -91,17 +94,28 @@ def load_finetuned_model_vllm():
     return llm, tokenizer
 
 
-def load_finetuned_model(use_vllm: bool = True, use_merged: bool = False, merged_model_path: Path = None):
+def load_finetuned_model(
+    use_vllm: bool = True,
+    use_merged: bool = False,
+    merged_model_path: Optional[Path] = None,
+    adapter_path: Optional[Path] = None,
+):
+    """
+    Load fine-tuned LoRA model. adapter_path overrides the default (FINAL_MODEL_DIR),
+    e.g. to evaluate a specific checkpoint: adapter_path=Path(".../checkpoint-2000").
+    """
     print("="*70)
     print("LOADING FINE-TUNED MODEL")
     print("="*70)
     
     if use_vllm:
         try:
-            return load_finetuned_model_vllm()
+            return load_finetuned_model_vllm(adapter_path=adapter_path)
         except Exception as e:
             print(f"\nWarning: Failed to load with vLLM: {e}")
             print("Falling back to transformers...")
+    
+    adapter_dir = adapter_path if adapter_path is not None else FINAL_MODEL_DIR
     
     if use_merged and merged_model_path:
         print(f"\nLoading merged model from: {merged_model_path}")
@@ -124,14 +138,14 @@ def load_finetuned_model(use_vllm: bool = True, use_merged: bool = False, merged
             trust_remote_code=True,
         )
         
-        if not FINAL_MODEL_DIR.exists():
+        if not adapter_dir.exists():
             raise FileNotFoundError(
-                f"Fine-tuned model not found at {FINAL_MODEL_DIR}. "
-                "Please run fine_tuning/train_lora.py first."
+                f"Fine-tuned model not found at {adapter_dir}. "
+                "Please run fine_tuning/train_lora.py first or use --checkpoint <name> for a saved checkpoint (e.g. checkpoint-2000)."
             )
         
-        print(f"Loading LoRA adapters from: {FINAL_MODEL_DIR}")
-        model = PeftModel.from_pretrained(base_model, str(FINAL_MODEL_DIR))
+        print(f"Loading LoRA adapters from: {adapter_dir}")
+        model = PeftModel.from_pretrained(base_model, str(adapter_dir))
         
         tokenizer = AutoTokenizer.from_pretrained(
             BASE_MODEL,

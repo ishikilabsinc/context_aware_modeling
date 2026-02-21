@@ -17,7 +17,7 @@ MODEL_OPTIONS = {
     "mistral-7b-instruct": "mistralai/Mistral-7B-Instruct-v0.3",
 }
 
-_MODEL_KEY = os.environ.get("MODEL", "qwen2.5-7b").strip().lower()
+_MODEL_KEY = os.environ.get("MODEL", "qwen3-4b-instruct").strip().lower()
 if _MODEL_KEY not in MODEL_OPTIONS:
     raise ValueError(
         f"Unknown MODEL='{_MODEL_KEY}'. Choose one of: {list(MODEL_OPTIONS.keys())}"
@@ -46,17 +46,17 @@ LORA_CONFIG = {
 
 TRAINING_CONFIG = {
     "output_dir": "checkpoints",
-    "num_train_epochs": 1,
-    "per_device_train_batch_size": 12,
-    "per_device_eval_batch_size": 12,
+    "num_train_epochs": 1,  # 2-3 often helps if underfitting; 1 is common for LoRA
+    "per_device_train_batch_size": 20,
+    "per_device_eval_batch_size": 20,
     "gradient_accumulation_steps": 2,
-    "learning_rate": 3e-4,
+    "learning_rate": 4.5e-4,
     "lr_scheduler_type": "cosine",
     "warmup_steps": 100,
     "logging_steps": 100,
-    "save_steps": 2000,
-    "eval_steps": 2000,
-    "save_total_limit": 3,
+    "save_steps": 4000,
+    "eval_steps": 400,
+    "save_total_limit": 10,
     "eval_strategy": "steps",
     "save_strategy": "steps",
     "load_best_model_at_end": True,
@@ -64,8 +64,8 @@ TRAINING_CONFIG = {
     "greater_is_better": True,
     "fp16": False,
     "bf16": True,
-    "gradient_checkpointing": False,
-    "optim": "adamw_torch",
+    "gradient_checkpointing": True,
+    "optim": "adamw_torch_fused",
     "report_to": "none",
     "seed": 42,
     "dataloader_num_workers": 4,

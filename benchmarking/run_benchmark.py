@@ -25,12 +25,6 @@ EVALUATE_SCRIPT = BENCHMARK_DIR / "evaluate_baseline.py"
 
 sys.path.insert(0, str(REPO_ROOT))
 from fine_tuning.config import MODEL_OPTIONS
-from utils.constants import (
-    ALL_CATEGORIES,
-    CATEGORY_NAMES,
-    SILENT_CATEGORIES,
-    SPEAK_CATEGORIES,
-)
 from benchmarking.metrics import compute_metrics, generate_detail_report
 
 DATASETS = ["ami", "friends", "spgi"]
@@ -238,9 +232,12 @@ def format_category_table(dataset: str, entries: List[Tuple[str, int, Dict]]) ->
     lines.append("SP = system prompt repeat. Acc = accuracy. SpP/SpR/SpF1 = Speak precision/recall/F1. SiP/SiR/SiF1 = Silent. FPR/FNR = false positive/negative rate. Lat(s) = latency mean.")
     lines.append("")
 
-    # Category accuracy table (existing grid)
+    # Category accuracy table (data-driven: use all categories present in results)
     cat_acc_entries = [(mk, sp, m.get("category_accuracy") or {}) for mk, sp, m in entries]
-    cols = [c for c in ALL_CATEGORIES if any(c in (e[2] or {}) for e in cat_acc_entries)]
+    all_cats = set()
+    for _mk, _sp, acc in cat_acc_entries:
+        all_cats.update((acc or {}).keys())
+    cols = sorted(all_cats)
     if not cols:
         lines.append(f"CATEGORY ACCURACY (%) — {dataset}")
         lines.append("No category accuracy data.")
@@ -264,7 +261,7 @@ def format_category_table(dataset: str, entries: List[Tuple[str, int, Dict]]) ->
         line = f"{model_key:<{model_width}} {sp:<4} " + " ".join(cells)
         lines.append(line)
     lines.append("")
-    lines.append("SP = system prompt repeat. I = SPEAK categories, S = SILENT categories.")
+    lines.append("SP = system prompt repeat. Columns = per-category accuracy (%).")
     lines.append("=" * (model_width + 4 + len(cols) * (col_width + 1)))
     return "\n".join(lines)
 

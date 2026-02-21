@@ -8,7 +8,7 @@ from typing import Dict, List
 
 import numpy as np
 
-from utils.constants import CATEGORY_NAMES, SILENT_CATEGORIES, SPEAK_CATEGORIES
+from utils.constants import CATEGORY_NAMES
 
 
 
@@ -225,20 +225,12 @@ def generate_detail_report(results: Dict) -> str:
     lines.append("")
     lines.append("PER-CATEGORY ACCURACY")
     lines.append("-" * 70)
-    lines.append("\nSPEAK Categories:")
-    for cat in SPEAK_CATEGORIES:
-        if cat in results.get("category_accuracy", {}):
-            m = results["category_accuracy"][cat]
-            lines.append(f"  {cat} ({CATEGORY_NAMES.get(cat, cat)}):")
-            lines.append(f"    Accuracy: {m['accuracy']:.2%}")
-            lines.append(f"    Correct: {m['correct']}/{m['total']}")
-    lines.append("\nSILENT Categories:")
-    for cat in SILENT_CATEGORIES:
-        if cat in results.get("category_accuracy", {}):
-            m = results["category_accuracy"][cat]
-            lines.append(f"  {cat} ({CATEGORY_NAMES.get(cat, cat)}):")
-            lines.append(f"    Accuracy: {m['accuracy']:.2%}")
-            lines.append(f"    Correct: {m['correct']}/{m['total']}")
+    cat_acc = results.get("category_accuracy", {})
+    for cat in sorted(cat_acc.keys()):
+        m = cat_acc[cat]
+        lines.append(f"  {cat} ({CATEGORY_NAMES.get(cat, cat)}):")
+        lines.append(f"    Accuracy: {m['accuracy']:.2%}")
+        lines.append(f"    Correct: {m['correct']}/{m['total']}")
     lines.append("")
     lines.append("CONFUSION MATRIX")
     lines.append("-" * 70)

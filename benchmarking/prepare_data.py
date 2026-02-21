@@ -31,6 +31,9 @@ TEST_RATIO = 0.1
 
 RANDOM_SEED = 42
 
+# Metadata/summary files in data dirs that are not sample data
+EXCLUDED_DATA_FILES = {'filtering_summary.json'}
+
 
 def list_local_files(data_dir: Path) -> List[Path]:
     if not data_dir.exists():
@@ -41,6 +44,7 @@ def list_local_files(data_dir: Path) -> List[Path]:
     for ext in ['*.json', '*.jsonl']:
         files.extend(data_dir.glob(ext))
     
+    files = [f for f in files if f.name not in EXCLUDED_DATA_FILES]
     files = sorted(files)
     print(f"Found {len(files)} files in {data_dir}")
     return files

@@ -1,137 +1,110 @@
 #!/usr/bin/env python3
 """
 Load and format training/val data for LoRA fine-tuning. Uses config for paths.
+Prompt format matches benchmarking/evaluate_baseline.py for fair train/eval comparison.
 """
 
-import json
-import re
+import sys
 from pathlib import Path
 from typing import List, Dict
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
-from config import TRAIN_FILE, VAL_FILE
+from config import TRAIN_FILE, VAL_FILE, DATASET, BASE_DIR
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
-SYSTEM_PROMPT = """You are a turn-taking decision model for a voice AI agent. Your job is to decide whether the AI agent should START TALKING or STAY SILENT after a detected pause in conversation.
-
-You will receive:
-1. An instruction telling you which speaker role the AI agent plays (e.g., "Speaker C" or "Speaker X" or "Nova")
-2. The previous conversation context with speaker-labeled transcript
-3. The current line: the most recent utterance before the pause
-
-RULES FOR DECIDING:
-
-STAY SILENT when:
-- The current speaker is talking to someone else, not the AI agent
-- The AI agent's name/role has not been referenced or addressed
-- The speaker is mid-thought, brainstorming, or thinking aloud and not seeking input
-- The sentence is clearly incomplete and the speaker is still formulating their thought
-- The conversation is between other participants and does not involve the AI agent
-- Someone mentions the AI agent in passing but is not requesting a response (e.g., "I was telling Speaker X about this earlier")
-- The speaker is making a rhetorical statement or exclamation, not asking a question
-
-START TALKING when:
-- The speaker directly addresses the AI agent by name/role with a question or request, possibly with ASR errors
-- The speaker asked the AI agent something and this is a clear follow-up to that exchange (even without re-stating the name)
-- The context makes it unambiguous that the speaker is waiting for the AI agent's response
-- The speaker redirects the conversation to the AI agent (e.g., "What do you think?" in a context where AI was part of the prior exchange)
-
-IMPORTANT NUANCES:
-- Once someone initiates a dialogue with the AI agent, follow-up turns from the same speaker are likely still directed at the AI agent until context clearly shifts away
-- In multi-party conversations, default to SILENT unless there is clear evidence the AI agent is being addressed
-- ASR (speech recognition) errors are common -- account for misspellings, homophones, and garbled names
-- When uncertain, prefer SILENT -- false interruptions are far worse than missed turns
-- An incomplete sentence after a long pause should remain SILENT if context suggests the speaker is still thinking, but should START TALKING if the incomplete sentence is clearly directed at the AI agent as a trailing question
-
-Output your decision in this exact format:
-<decision>SILENT or SPEAK</decision>
-<confidence>high, medium, or low</confidence>
-<reason>one line explanation</reason>"""
-
-
-
-def format_context_turns(context_turns: List[Dict], max_turns: int = None) -> str:
-    if not context_turns:
-        return "(No previous context)"
-    
-    if max_turns is not None and len(context_turns) > max_turns:
-        context_turns = context_turns[-max_turns:]
-    
-    lines = []
-    for turn in context_turns:
-        lines.append(f"Speaker {turn['speaker']}: {turn['text']}")
-    
-    return "\n".join(lines)
-
-
-def format_current_turn(current_turn: Dict) -> str:
-    return f"Speaker {current_turn['speaker']}: {current_turn['text']}"
+def _get_system_prompt_for_training() -> str:
+    from benchmarking.evaluate_baseline import _get_system_prompt_content
+    return _get_system_prompt_content()
 
 
 def estimate_tokens(text: str, tokenizer) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False, max_length=10000, truncation=True))
 
 
-def create_training_prompt(sample: Dict, tokenizer, max_length: int) -> str:
-    target_speaker = sample.get('target_speaker', '?')
-    instruction = f"You are playing the role of Speaker {target_speaker}. Decide if you should SPEAK or stay SILENT after the current utterance."
-    current_str = format_current_turn(sample.get('current_turn', {}))
-    decision = sample.get('decision', 'UNKNOWN')
-    confidence = sample.get('confidence', 'medium')
-    reason = sample.get('reason', '')
-    
-    system_tokens = estimate_tokens(SYSTEM_PROMPT, tokenizer)
-    instruction_tokens = estimate_tokens(instruction, tokenizer)
-    current_tokens = estimate_tokens(current_str, tokenizer)
-    output_tokens = estimate_tokens(f"<decision>{decision}</decision><confidence>{confidence}</confidence><reason>{reason}</reason>", tokenizer)
-    
-    reserved_tokens = system_tokens + instruction_tokens + current_tokens + output_tokens + 100
-    available_tokens = max_length - reserved_tokens
-    
-    context_turns = sample.get('context_turns', [])
-    if not context_turns or available_tokens <= 0:
-        context_str = format_context_turns(context_turns)
-    else:
-        context_str = _select_context_turns(context_turns, tokenizer, available_tokens)
-    
-    prompt = f"""<|system|>{SYSTEM_PROMPT}<|/system|>
-<|instruction|>{instruction}<|/instruction|>
-<|context|>{context_str}<|/context|>
-<|current|>{current_str}<|/current|>
-<decision>{decision}</decision>
-<confidence>{confidence}</confidence>
-<reason>{reason}</reason>"""
-    
-    return prompt
-
-
-def _select_context_turns(context_turns: List[Dict], tokenizer, max_tokens: int) -> str:
-    if not context_turns:
+def _build_context_str_benchmark_style(
+    context_turns: List[Dict],
+    current_turn: Dict,
+    tokenizer,
+    max_tokens: int,
+) -> str:
+    """
+    Build context string in the same format as benchmarking/evaluate_baseline.py
+    (all_turns with last one marked [MOST RECENT - after this there was a pause]).
+    Selects turns from the end to fit within max_tokens.
+    """
+    all_turns = context_turns + ([current_turn] if current_turn else [])
+    if not all_turns:
         return "(No previous context)"
-    
-    selected_turns = []
+    if max_tokens <= 0:
+        return "(No previous context)"
+    selected = []
     current_tokens = 0
-    
-    for turn in reversed(context_turns):
-        turn_str = f"Speaker {turn['speaker']}: {turn['text']}\n"
-        turn_tokens = estimate_tokens(turn_str, tokenizer)
-        
+    for turn in reversed(all_turns):
+        line = f"Speaker {turn.get('speaker', '?')}: {turn.get('text', '')}"
+        if current_turn and turn == current_turn:
+            line += "  [MOST RECENT - after this there was a pause]"
+        turn_tokens = estimate_tokens(line + "\n", tokenizer)
         if current_tokens + turn_tokens <= max_tokens:
-            selected_turns.insert(0, turn)
+            selected.insert(0, (turn, line))
             current_tokens += turn_tokens
         else:
             break
-    
-    if not selected_turns:
+    if not selected:
         return "(No previous context)"
-    
-    lines = []
-    for turn in selected_turns:
-        lines.append(f"Speaker {turn['speaker']}: {turn['text']}")
-    
-    return "\n".join(lines)
+    return "\n".join(line for _, line in selected)
 
+
+def create_training_prompt(sample: Dict, tokenizer, max_length: int) -> str:
+    """Build prompt in same format as benchmark format_sample_for_inference."""
+    system_prompt = _get_system_prompt_for_training()
+    context_turns = sample.get("context_turns", [])
+    current_turn = sample.get("current_turn", {})
+    target_speaker = sample.get("target_speaker", "?")
+    decision = sample.get("decision", "UNKNOWN")
+    if decision not in ("SPEAK", "SILENT"):
+        decision = "SILENT" if decision.upper() == "SILENT" else "SPEAK"
+    confidence = sample.get("confidence", "medium")
+    reason = sample.get("reason", "")
+
+    instruction = (
+        f"You are playing the role of Speaker {target_speaker}. The conversation history above shows all utterances including the most recent one (marked as [MOST RECENT]). "
+        "After that most recent utterance, there was a pause. Decide if you (Speaker {target_speaker}) should START TALKING or STAY SILENT now."
+    )
+    if current_turn:
+        current_str = f"Speaker {current_turn.get('speaker', '?')}: {current_turn.get('text', '')}"
+    else:
+        current_str = "(No current utterance)"
+
+    reply_format = (
+        "Reply with your decision in this exact format: <reasoning>One sentence: ACTIVE PARTICIPANT or BYSTANDER, and who is addressed.</reasoning> "
+        "<decision>SPEAK</decision> or <decision>SILENT</decision> <confidence>high</confidence> or <confidence>medium</confidence> or <confidence>low</confidence>"
+    )
+    output_part = f"<reasoning>{reason}</reasoning> <decision>{decision}</decision> <confidence>{confidence}</confidence>"
+
+    system_tokens = estimate_tokens(system_prompt, tokenizer)
+    instruction_tokens = estimate_tokens(instruction, tokenizer)
+    current_block = f"MOST RECENT UTTERANCE (the previous utterance that just occurred): {current_str}"
+    current_tokens = estimate_tokens(current_block, tokenizer)
+    reply_tokens = estimate_tokens(reply_format, tokenizer)
+    output_tokens = estimate_tokens(output_part, tokenizer)
+    reserved = system_tokens + instruction_tokens + current_tokens + reply_tokens + output_tokens + 150
+    available_context = max(0, max_length - reserved)
+    context_str = _build_context_str_benchmark_style(
+        context_turns, current_turn, tokenizer, available_context
+    )
+
+    prompt = f"""<|system|>{system_prompt}<|/system|>
+<|instruction|>{instruction}<|/instruction|>
+<|context|>{context_str}<|/context|>
+<|current|>MOST RECENT UTTERANCE (the previous utterance that just occurred): {current_str}<|/current|>
+{reply_format}
+<reasoning>{reason}</reasoning> <decision>{decision}</decision> <confidence>{confidence}</confidence>"""
+    return prompt
 
 
 class TurnTakingDataset(Dataset):
@@ -170,28 +143,154 @@ class TurnTakingDataset(Dataset):
 
 
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import random
+from torch.utils.data import Sampler
+
 from utils.data_utils import load_samples
 
+ALL_DATASETS = ["ami", "friends", "spgi"]
 
-def prepare_datasets(tokenizer: AutoTokenizer, max_length: int = 2048, debug: bool = False):
-    print("Loading training data...")
-    train_samples = load_samples(TRAIN_FILE)
-    print(f"  Loaded {len(train_samples):,} training samples")
-    print("Loading validation data...")
-    val_samples = load_samples(VAL_FILE)
-    print(f"  Loaded {len(val_samples):,} validation samples")
-    
+
+class BalancedBatchSampler(Sampler):
+    """
+    Yields batches of indices with roughly 50% SPEAK and 50% SILENT per batch
+    so each batch has representation from both decisions.
+    """
+    def __init__(self, speak_indices: List[int], silent_indices: List[int], batch_size: int, shuffle: bool = True):
+        self.speak_indices = speak_indices
+        self.silent_indices = silent_indices
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        half = max(1, batch_size // 2)
+        self.half = half
+        self.n_batches = min(len(speak_indices) // half, len(silent_indices) // half)
+
+    def __iter__(self):
+        speak = list(self.speak_indices)
+        silent = list(self.silent_indices)
+        if self.shuffle:
+            random.shuffle(speak)
+            random.shuffle(silent)
+        half = self.half
+        for i in range(self.n_batches):
+            batch = speak[i * half : (i + 1) * half] + silent[i * half : (i + 1) * half]
+            random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self.n_batches
+
+
+class DistributedBalancedBatchSampler(Sampler):
+    """
+    Distributed version of BalancedBatchSampler: each rank gets a partition of
+    SPEAK/SILENT indices and builds ~50/50 batches from that partition so
+    no sample is seen by two ranks and each rank still gets balanced batches.
+    """
+    def __init__(
+        self,
+        speak_indices: List[int],
+        silent_indices: List[int],
+        batch_size: int,
+        rank: int,
+        world_size: int,
+        shuffle: bool = True,
+    ):
+        self.batch_size = batch_size
+        self.rank = rank
+        self.world_size = world_size
+        self.shuffle = shuffle
+        # Partition indices across ranks: this rank gets indices at position rank, rank+world_size, ...
+        self.my_speak = [speak_indices[i] for i in range(rank, len(speak_indices), world_size)]
+        self.my_silent = [silent_indices[i] for i in range(rank, len(silent_indices), world_size)]
+        half = max(1, batch_size // 2)
+        self.half = half
+        self.n_batches = min(len(self.my_speak) // half, len(self.my_silent) // half)
+
+    def __iter__(self):
+        speak = list(self.my_speak)
+        silent = list(self.my_silent)
+        if self.shuffle:
+            random.shuffle(speak)
+            random.shuffle(silent)
+        half = self.half
+        for i in range(self.n_batches):
+            batch = speak[i * half : (i + 1) * half] + silent[i * half : (i + 1) * half]
+            random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self.n_batches
+
+
+def prepare_datasets(
+    tokenizer: AutoTokenizer,
+    max_length: int = 2048,
+    debug: bool = False,
+    batch_size: int = None,
+    use_balanced_batches: bool = True,
+    rank: int = None,
+    world_size: int = None,
+):
+    if DATASET == "all":
+        print("Loading training data from all datasets (ami, friends, spgi)...")
+        train_samples = []
+        for name in ALL_DATASETS:
+            path = BASE_DIR / "data" / name / "train" / "train_samples.jsonl"
+            if path.exists():
+                part = load_samples(path)
+                train_samples.extend(part)
+                print(f"  {name}: {len(part):,} samples")
+            else:
+                print(f"  {name}: (file not found, skipping)")
+        print(f"  Total training samples: {len(train_samples):,}")
+
+        print("Loading validation data from all datasets...")
+        val_samples = []
+        for name in ALL_DATASETS:
+            path = BASE_DIR / "data" / name / "val" / "val_samples.jsonl"
+            if path.exists():
+                part = load_samples(path)
+                val_samples.extend(part)
+                print(f"  {name}: {len(part):,} samples")
+            else:
+                print(f"  {name}: (file not found, skipping)")
+        print(f"  Total validation samples: {len(val_samples):,}")
+    else:
+        print("Loading training data...")
+        train_samples = load_samples(TRAIN_FILE)
+        print(f"  Loaded {len(train_samples):,} training samples")
+        print("Loading validation data...")
+        val_samples = load_samples(VAL_FILE)
+        print(f"  Loaded {len(val_samples):,} validation samples")
+
     print("Creating datasets...")
     train_dataset = TurnTakingDataset(train_samples, tokenizer, max_length, debug=debug)
     val_dataset = TurnTakingDataset(val_samples, tokenizer, max_length, debug=debug)
-    
     print(f"  Train dataset: {len(train_dataset):,} samples")
     print(f"  Val dataset: {len(val_dataset):,} samples")
-    
-    return train_dataset, val_dataset
+
+    batch_sampler = None
+    if use_balanced_batches and batch_size is not None and batch_size >= 2:
+        speak_idx = [i for i, s in enumerate(train_samples) if s.get("decision") == "SPEAK"]
+        silent_idx = [i for i, s in enumerate(train_samples) if s.get("decision") == "SILENT"]
+        half = max(1, batch_size // 2)
+        if len(speak_idx) >= half and len(silent_idx) >= half:
+            if rank is not None and world_size is not None:
+                batch_sampler = DistributedBalancedBatchSampler(
+                    speak_idx, silent_idx, batch_size, rank, world_size, shuffle=True
+                )
+                n_batches = len(batch_sampler)
+                if rank == 0:
+                    print(f"  Distributed balanced batch sampler (world_size={world_size}): {n_batches:,} batches/rank (~50% SPEAK / 50% SILENT per batch)")
+            else:
+                batch_sampler = BalancedBatchSampler(speak_idx, silent_idx, batch_size, shuffle=True)
+                n_batches = len(batch_sampler)
+                print(f"  Balanced batch sampler: {n_batches:,} batches (~50% SPEAK / 50% SILENT per batch)")
+        else:
+            print("  Skipping balanced batches (not enough SPEAK or SILENT samples); using default shuffling")
+
+    return train_dataset, val_dataset, batch_sampler
 
 
 
