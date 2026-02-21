@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-Evaluate fine-tuned model on test set and compare with baseline. Uses config for model/dataset.
+Evaluate fine-tuned LoRA model on test set and compare with baseline. Uses vLLM for fast inference.
+Run: python evaluation/evaluate_finetuned.py --dataset <name> --model <key> [--lora-rank N]
 """
+# vLLM engine runs in a subprocess; must set spawn before other imports so CUDA can init (Linux default is fork)
+import os
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+# Also set Python's multiprocessing start method for any other subprocesses
+import multiprocessing
+try:
+    multiprocessing.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass  # already set (e.g. by launcher)
 
 import argparse
 import json
@@ -43,13 +53,15 @@ def infer_with_vllm(model, tokenizer, prompts: List[str]) -> List[Tuple[str, flo
     )
     
     lora_adapter = getattr(model, '_lora_adapter_name', None)
-    
+    lora_path = getattr(model, '_lora_adapter_path', None)
+
     start_time = time.time()
-    if lora_adapter:
+    if lora_adapter and lora_path:
         try:
             from vllm.lora.request import LoRARequest
-            lora_requests = [LoRARequest(lora_adapter, 1, 0)] * len(prompts)
-            outputs = model.generate(prompts, sampling_params, lora_request=lora_requests)
+            # LoRARequest(lora_name, lora_int_id, lora_path) — applied per request
+            lora_request = LoRARequest(lora_adapter, 1, lora_path)
+            outputs = model.generate(prompts, sampling_params, lora_request=lora_request)
         except Exception as e:
             print(f"Warning: Could not use LoRA adapter in generation: {e}")
             outputs = model.generate(prompts, sampling_params)
@@ -338,7 +350,11 @@ def main(
     print("=" * 70)
 
     print("\nLoading fine-tuned model...")
-    model_obj, tokenizer = load_finetuned_model(use_vllm=USE_VLLM, adapter_path=adapter_path)
+    model_obj, tokenizer = load_finetuned_model(
+        use_vllm=USE_VLLM,
+        adapter_path=adapter_path,
+        lora_rank=lora_rank,
+    )
 
     print(f"\nLoading samples from {EVAL_FILE}...")
     samples = load_samples(EVAL_FILE)

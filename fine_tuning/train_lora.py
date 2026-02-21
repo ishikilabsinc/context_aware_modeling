@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """
-LoRA fine-tuning for context-aware turn-taking. Uses config for model, dataset, paths.
+LoRA fine-tuning for context-aware turn-taking.
+
+- Normal run: trains and saves the PEFT adapter to checkpoints/<model>_r<N>/final_model/
+  (with FSDP, adapter is saved at the end after gathering full state).
+- If training was interrupted or final_model is missing: use --resume-from-checkpoint
+  pointing at a checkpoint dir (e.g. .../checkpoint-1008). The script loads that checkpoint,
+  does zero new steps, and saves the adapter to final_model. Same command as training,
+  with --resume-from-checkpoint added.
 """
 
 import argparse
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -163,7 +172,13 @@ class TrainerWithBalancedBatches(Trainer):
         return super().get_train_dataloader()
 
 
-def main(dataset: str = "ami", lora_rank=None, use_fsdp=False, max_length: int = 256):
+def main(
+    dataset: str = "ami",
+    lora_rank=None,
+    use_fsdp=False,
+    max_length: int = 256,
+    resume_from_checkpoint: Optional[str] = None,
+):
     os.environ["DATASET"] = dataset
     if "config" in sys.modules:
         importlib.reload(sys.modules["config"])
@@ -250,6 +265,17 @@ def main(dataset: str = "ami", lora_rank=None, use_fsdp=False, max_length: int =
     if training_config.get("optim") == "adamw_torch_fused" and not torch.cuda.is_available():
         training_config["optim"] = "adamw_torch"
 
+    # Resume-from-checkpoint: set max_steps to checkpoint's global_step so we load and then save (no extra training)
+    if resume_from_checkpoint:
+        state_path = Path(resume_from_checkpoint) / "trainer_state.json"
+        if not state_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint missing trainer_state.json: {state_path}")
+        with open(state_path) as f:
+            trainer_state = json.load(f)
+        global_step = trainer_state.get("global_step", 0)
+        training_config["max_steps"] = global_step
+        print(f"Resume from {resume_from_checkpoint} (global_step={global_step}); will load then save adapter (no new steps).")
+
     training_args = TrainingArguments(
         output_dir=str(run_output_dir),
         **training_config
@@ -281,8 +307,8 @@ def main(dataset: str = "ami", lora_rank=None, use_fsdp=False, max_length: int =
     print("\n" + "="*70)
     print("STARTING TRAINING")
     print("="*70)
-    
-    trainer.train()
+
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     # Plot training curve (loss / eval loss / lr) for stability inspection
     try:
@@ -300,6 +326,11 @@ def main(dataset: str = "ami", lora_rank=None, use_fsdp=False, max_length: int =
     print("="*70)
 
     run_final_model_dir.mkdir(parents=True, exist_ok=True)
+    # With FSDP, Trainer only saves properly after gathering full state (so PEFT adapter is saved)
+    if getattr(trainer, "is_fsdp_enabled", False) and getattr(
+        trainer.accelerator.state, "fsdp_plugin", None
+    ):
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     trainer.save_model(str(run_final_model_dir))
     tokenizer.save_pretrained(str(run_final_model_dir))
 
@@ -338,5 +369,18 @@ if __name__ == "__main__":
         metavar="N",
         help="Max sequence length (default: 256 for fast runs). Use 512 or 1024 for fair benchmark-aligned training (may require smaller batch size).",
     )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Resume from this checkpoint (e.g. .../checkpoint-1008), then save PEFT adapter to final_model. No new training steps.",
+    )
     args = parser.parse_args()
-    main(dataset=args.dataset, lora_rank=args.lora_rank, use_fsdp=args.fsdp, max_length=args.max_length)
+    main(
+        dataset=args.dataset,
+        lora_rank=args.lora_rank,
+        use_fsdp=args.fsdp,
+        max_length=args.max_length,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+    )

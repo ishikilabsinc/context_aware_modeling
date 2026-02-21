@@ -17,8 +17,8 @@ This repository trains and evaluates language models for **context-aware turn-ta
 |----------------|---------|
 | `data/`        | Raw and processed data per dataset (train/val/test). Gitignored. |
 | `benchmarking/`| Prepare data, validate, **run_benchmark** (all models x datasets x system prompt 1&2), or single-run evaluate_baseline. |
-| `fine_tuning/` | LoRA fine-tuning (config, train, checkpoints). |
-| `evaluation/`  | Load fine-tuned model, evaluate, compare to baseline, reports. |
+| `fine_tuning/` | LoRA fine-tuning: **train_lora.py** (config, checkpoints, FSDP). |
+| `evaluation/`  | **evaluate_finetuned.py**: load fine-tuned model (vLLM), evaluate, compare to baseline. |
 | `utils/`       | Shared constants and data utilities. |
 | `ami/`         | AMI pipeline (stages for data prep, labeling, etc.). |
 
@@ -113,43 +113,39 @@ Add `--debug-prompts` to print the full system prompt, instruction, and model in
 python benchmarking/evaluate_baseline.py --dataset ami --model qwen2.5-7b --system-prompt-repeat 1 --debug-prompts
 ```
 
-### 4. Fine-tune (optional)
+### 4. Fine-tune
 
-Training uses the **train** split; the **val** split is used for validation during training. Set `MODEL` and optionally `DATASET`, then train:
+**Single script:** `fine_tuning/train_lora.py`. Training uses the **train** split; **val** is used for validation. Checkpoints and the final PEFT adapter are written to `fine_tuning/checkpoints/<model>_r<N>/` (or `<model>/` if you omit `--lora-rank`).
+
+**Multi-GPU LoRA with FSDP (recommended):**
 
 ```bash
-export MODEL=qwen2.5-7b
-# Single dataset (default: ami)
-python fine_tuning/train_lora.py --dataset ami
-
-# All three datasets combined (single training run)
-python fine_tuning/train_lora.py --dataset all
-
-# Try higher LoRA rank for more capacity (saved to checkpoints/<model>_r32/ or _r64/)
-python fine_tuning/train_lora.py --dataset all --lora-rank 32
-python fine_tuning/train_lora.py --dataset all --lora-rank 64
-
-# FSDP: reduce OOM by sharding model across GPUs (use with accelerate launch)
-# Config uses 4 GPUs by default; override with --num_processes N if needed
-accelerate launch --config_file fine_tuning/accelerate_fsdp_config.yaml fine_tuning/train_lora.py --fsdp --dataset all
+# Same dataset/env as your data; use --lora-rank 32 (or 64) for more capacity
+accelerate launch --config_file fine_tuning/accelerate_fsdp_config.yaml \
+  fine_tuning/train_lora.py --dataset friends --lora-rank 32 --fsdp
 ```
 
-With `--dataset all`, train (and val) samples from ami, friends, and spgi are loaded and concatenated. With **`--fsdp`**, the model is loaded on CPU and sharded across GPUs (Fully Sharded Data Parallel) to cut memory per GPU and avoid OOM; you must run with **`accelerate launch`** and 2+ processes (e.g. `fine_tuning/accelerate_fsdp_config.yaml` uses 4 GPUs by default; override with `--num_processes N`). Balanced SPEAK/SILENT batching (~50% each per batch) is used for both single-GPU and FSDP runs (a distributed balanced batch sampler partitions data across ranks when using `--fsdp`). With `--lora-rank N`, LoRA rank is set to N (default from config is 8); output is written to `checkpoints/<model>_r<N>/` so you can compare runs. **`--max-length N`** sets the training sequence length (default 256 for fast runs; use 512 or 1024 for benchmark-aligned training; 1024 may require smaller batch size in config). Evaluate with `python evaluation/evaluate_finetuned.py --dataset ami --model qwen2.5-7b --lora-rank 32`. Checkpoints (per model) are under `fine_tuning/checkpoints/<model_key>/`. For faster training with no impact on model quality: **Flash Attention 2** is used automatically when `flash-attn` is installed; otherwise **SDPA** (PyTorch built-in) is used for faster attention with no extra install. Eval/save run every 4000 steps; fused optimizer is used on CUDA (set `optim` to `adamw_torch` in `fine_tuning/config.py` if your environment does not support it). After each run, a **training curve** (train loss, eval loss, learning rate) is saved as `training_curve.png` in that directory to inspect stability; you can also run `python fine_tuning/plot_training_curve.py --model <key>` to regenerate from `trainer_state.json`.
+- **Output:** `fine_tuning/checkpoints/qwen3-4b-instruct_r32/checkpoint-*` during training; at the end the PEFT adapter is saved to `.../final_model/` (adapter_config.json + weights + tokenizer). The config uses 4 GPUs by default; override with `--num_processes N` if needed.
+- **If training stops before saving:** Run the same command and add `--resume-from-checkpoint fine_tuning/checkpoints/qwen3-4b-instruct_r32/checkpoint-1008` (use your latest checkpoint). The script loads that checkpoint, does zero new steps, and writes the adapter to `final_model/`.
+
+**Single-GPU (no FSDP):**
+
+```bash
+python fine_tuning/train_lora.py --dataset friends --lora-rank 32
+```
+
+**Options:** `--dataset` (ami | friends | spgi | all). `--lora-rank N` writes to `checkpoints/<model>_r<N>/`. `--max-length 256` (default; use 512 or 1024 for longer context). With `--dataset all`, train/val from ami, friends, and spgi are combined. Balanced SPEAK/SILENT batching is used. After training, a **training curve** is saved as `training_curve.png` in the run directory.
 
 ### 5. Evaluate fine-tuned model
 
-Evaluation runs on the **test** split. Uses dataset and model from config/env; loads LoRA from `fine_tuning/checkpoints/<model>/`:
+**Single script:** `evaluation/evaluate_finetuned.py`. Uses **vLLM** for fast inference. Evaluation runs on the **test** split and loads the PEFT adapter from `fine_tuning/checkpoints/<model>_r<N>/final_model/` (or `final_model` under `<model>/` if no `--lora-rank`).
 
 ```bash
-python evaluation/evaluate_finetuned.py --dataset ami --model qwen2.5-7b
+# Match --dataset, --model, and --lora-rank to your training run
+python evaluation/evaluate_finetuned.py --dataset friends --model qwen3-4b-instruct --lora-rank 32
 ```
 
-To see if the needle moved after the first checkpoint (e.g. one epoch), evaluate a specific checkpoint. Results are written to separate files so you can compare baseline vs first checkpoint vs final:
-
-```bash
-python evaluation/evaluate_finetuned.py --dataset ami --model qwen2.5-7b --checkpoint checkpoint-2000
-# Default is --checkpoint final (the best model saved at end of training).
-```
+Results are written to `evaluation/results/` (e.g. `finetuned_results_friends_qwen3-4b-instruct_r32.json` and `baseline_vs_finetuned_...`). To evaluate a specific checkpoint instead of `final_model`, use `--checkpoint checkpoint-1008` (default is `--checkpoint final`).
 
 ---
 

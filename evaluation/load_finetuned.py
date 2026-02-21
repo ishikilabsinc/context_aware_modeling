@@ -18,24 +18,36 @@ from peft import PeftModel
 from fine_tuning.config import BASE_MODEL, FINAL_MODEL_DIR
 
 
-def load_finetuned_model_vllm(adapter_path: Optional[Path] = None):
+def load_finetuned_model_vllm(
+    adapter_path: Optional[Path] = None,
+    lora_rank: Optional[int] = None,
+):
     from vllm import LLM
     from transformers import AutoTokenizer
     import os
-    
+
     adapter_dir = adapter_path if adapter_path is not None else FINAL_MODEL_DIR
     print("\nLoading fine-tuned model with vLLM...")
     print(f"Base model: {BASE_MODEL}")
     print(f"LoRA adapters: {adapter_dir}")
-    
+
     if not adapter_dir.exists():
         raise FileNotFoundError(
             f"Fine-tuned model not found at {adapter_dir}. "
             "Please run fine_tuning/train_lora.py first or use --checkpoint <name> for a saved checkpoint (e.g. checkpoint-2000)."
         )
-    
+    if not (adapter_dir / "adapter_config.json").is_file():
+        raise FileNotFoundError(
+            f"LoRA adapter config not found at {adapter_dir} (missing adapter_config.json). "
+            "If you trained with FSDP and final_model was not saved, run train_lora.py with "
+            "--resume-from-checkpoint <path-to-checkpoint> (same --dataset, --lora-rank, --fsdp as training). "
+            "Then re-run evaluation."
+        )
+
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    
+    # vLLM needs max_lora_rank >= training rank (e.g. 32 for r32)
+    max_lora_rank = max(64, (lora_rank or 0) * 2) if lora_rank else 64
+
     print("\nLoading model with vLLM (native LoRA support)...")
     llm = LLM(
         model=BASE_MODEL,
@@ -46,36 +58,16 @@ def load_finetuned_model_vllm(adapter_path: Optional[Path] = None):
         max_num_seqs=64,  # Reduced from 128 to avoid OOM during warmup
         trust_remote_code=True,
         enable_lora=True,  # Enable LoRA support
-        max_lora_rank=16,  # Maximum LoRA rank
+        max_lora_rank=max_lora_rank,
         max_loras=1,  # Number of LoRA adapters
     )
-    
+
+    # vLLM loads LoRA per request via LoRARequest(lora_name, lora_int_id, lora_path), not add_lora()
     adapter_name = "finetuned_lora"
-    lora_loaded = False
-    
-    try:
-        if hasattr(llm, 'llm_engine') and hasattr(llm.llm_engine, 'add_lora'):
-            llm.llm_engine.add_lora(adapter_name, str(adapter_dir))
-            lora_loaded = True
-            print(f"LoRA adapter '{adapter_name}' loaded successfully via llm_engine.add_lora")
-        elif hasattr(llm, 'add_lora'):
-            llm.add_lora(adapter_name, str(adapter_dir))
-            lora_loaded = True
-            print(f"LoRA adapter '{adapter_name}' loaded successfully via add_lora")
-        else:
-            print("Warning: Could not find LoRA loading method.")
-            print(f"Available methods with 'lora': {[m for m in dir(llm) if 'lora' in m.lower()]}")
-            if hasattr(llm, 'llm_engine'):
-                print(f"Engine methods with 'lora': {[m for m in dir(llm.llm_engine) if 'lora' in m.lower()]}")
-            adapter_name = None
-    except Exception as e:
-        print(f"Warning: Could not load LoRA adapter: {e}")
-        import traceback
-        traceback.print_exc()
-        print("Will proceed with base model (LoRA not applied, but vLLM is still faster)")
-        adapter_name = None
-        lora_loaded = False
-    
+    llm._lora_adapter_name = adapter_name
+    llm._lora_adapter_path = str(adapter_dir)
+    print(f"LoRA adapter will be applied at request time from: {adapter_dir}")
+
     tokenizer = AutoTokenizer.from_pretrained(
         BASE_MODEL,
         trust_remote_code=True,
@@ -85,12 +77,9 @@ def load_finetuned_model_vllm(adapter_path: Optional[Path] = None):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    llm._lora_adapter_name = adapter_name
-    llm._lora_adapter_path = str(adapter_dir)
-    
+
     print("\nModel loaded successfully with vLLM")
-    if adapter_name:
-        print(f"  LoRA adapter: {adapter_name}")
+    print(f"  LoRA adapter: {adapter_name} ({adapter_dir})")
     return llm, tokenizer
 
 
@@ -99,18 +88,23 @@ def load_finetuned_model(
     use_merged: bool = False,
     merged_model_path: Optional[Path] = None,
     adapter_path: Optional[Path] = None,
+    lora_rank: Optional[int] = None,
 ):
     """
     Load fine-tuned LoRA model. adapter_path overrides the default (FINAL_MODEL_DIR),
     e.g. to evaluate a specific checkpoint: adapter_path=Path(".../checkpoint-2000").
+    lora_rank: used for vLLM max_lora_rank (e.g. 32 for r32 runs).
     """
     print("="*70)
     print("LOADING FINE-TUNED MODEL")
     print("="*70)
-    
+
     if use_vllm:
         try:
-            return load_finetuned_model_vllm(adapter_path=adapter_path)
+            return load_finetuned_model_vllm(
+                adapter_path=adapter_path,
+                lora_rank=lora_rank,
+            )
         except Exception as e:
             print(f"\nWarning: Failed to load with vLLM: {e}")
             print("Falling back to transformers...")
@@ -143,7 +137,13 @@ def load_finetuned_model(
                 f"Fine-tuned model not found at {adapter_dir}. "
                 "Please run fine_tuning/train_lora.py first or use --checkpoint <name> for a saved checkpoint (e.g. checkpoint-2000)."
             )
-        
+        adapter_config = adapter_dir / "adapter_config.json"
+        if not adapter_config.is_file():
+            raise FileNotFoundError(
+                f"LoRA adapter config not found at {adapter_dir} (missing adapter_config.json). "
+                "If you trained with FSDP, re-run training with the updated train_lora.py so the final model is saved with FULL_STATE_DICT. "
+                "Alternatively evaluate with vLLM: python evaluation/evaluate_finetuned.py (uses vLLM by default)."
+            )
         print(f"Loading LoRA adapters from: {adapter_dir}")
         model = PeftModel.from_pretrained(base_model, str(adapter_dir))
         

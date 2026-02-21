@@ -48,18 +48,18 @@ TRAINING_CONFIG = {
     "output_dir": "checkpoints",
     "num_train_epochs": 1,  # 2-3 often helps if underfitting; 1 is common for LoRA
     "per_device_train_batch_size": 20,
-    "per_device_eval_batch_size": 20,
+    "per_device_eval_batch_size": 8,  # smaller than train to avoid OOM during eval (FSDP)
     "gradient_accumulation_steps": 2,
     "learning_rate": 4.5e-4,
     "lr_scheduler_type": "cosine",
     "warmup_steps": 100,
     "logging_steps": 100,
-    "save_steps": 4000,
-    "eval_steps": 400,
+    "save_steps": 100,  # save mid-epoch so we have a restore point if the run crashes
+    "eval_steps": 50,
     "save_total_limit": 10,
-    "eval_strategy": "steps",
+    "eval_strategy": "no",  # disabled to avoid eval OOM; run evaluation after training
     "save_strategy": "steps",
-    "load_best_model_at_end": True,
+    "load_best_model_at_end": False,  # requires eval; use False when eval_strategy is "no"
     "metric_for_best_model": "accuracy",
     "greater_is_better": True,
     "fp16": False,
