@@ -35,6 +35,8 @@ def plot_training_curve(
 
     steps, train_losses = [], []
     eval_steps, eval_losses = [], []
+    eval_acc_steps, eval_acc_values = [], []
+    eval_f1_steps, eval_f1_values = [], []
     lr_steps, lr_values = [], []
 
     for entry in log_history:
@@ -43,8 +45,15 @@ def plot_training_curve(
             steps.append(step)
             train_losses.append(entry["loss"])
         if "eval_loss" in entry:
-            eval_steps.append(entry.get("step", 0))
+            s = entry.get("step", 0)
+            eval_steps.append(s)
             eval_losses.append(entry["eval_loss"])
+            if "eval_accuracy" in entry:
+                eval_acc_steps.append(s)
+                eval_acc_values.append(entry["eval_accuracy"])
+            if "eval_macro_f1" in entry:
+                eval_f1_steps.append(s)
+                eval_f1_values.append(entry["eval_macro_f1"])
         if "learning_rate" in entry:
             lr_steps.append(entry.get("step", 0))
             lr_values.append(entry["learning_rate"])
@@ -66,7 +75,18 @@ def plot_training_curve(
     ax1.legend(loc="upper right")
     ax1.grid(True, alpha=0.3)
 
-    if lr_steps and lr_values:
+    has_secondary = False
+    if eval_f1_steps and eval_f1_values:
+        ax2 = ax1.twinx()
+        ax2.plot(eval_f1_steps, eval_f1_values, "orange", alpha=0.9, label="Eval macro F1")
+        if eval_acc_steps and eval_acc_values:
+            ax2.plot(eval_acc_steps, eval_acc_values, "purple", alpha=0.7, label="Eval accuracy")
+        ax2.set_ylabel("Eval metric", color="gray")
+        ax2.set_ylim(0, 1.05)
+        ax2.tick_params(axis="y", labelcolor="gray")
+        ax2.legend(loc="upper right", bbox_to_anchor=(1.0, 0.85))
+        has_secondary = True
+    if lr_steps and lr_values and not has_secondary:
         ax2 = ax1.twinx()
         ax2.plot(lr_steps, lr_values, "gray", alpha=0.6, linestyle="--", label="Learning rate")
         ax2.set_ylabel("Learning rate", color="gray")

@@ -27,6 +27,7 @@ import numpy as np
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL
+import benchmarking.evaluate_baseline as baseline_module
 from benchmarking.evaluate_baseline import (
     format_sample_for_inference,
     extract_decision_from_output,
@@ -59,7 +60,6 @@ def infer_with_vllm(model, tokenizer, prompts: List[str]) -> List[Tuple[str, flo
     if lora_adapter and lora_path:
         try:
             from vllm.lora.request import LoRARequest
-            # LoRARequest(lora_name, lora_int_id, lora_path) — applied per request
             lora_request = LoRARequest(lora_adapter, 1, lora_path)
             outputs = model.generate(prompts, sampling_params, lora_request=lora_request)
         except Exception as e:
@@ -91,7 +91,7 @@ def infer_with_model_batch(model, tokenizer, prompts: List[str]) -> List[Tuple[s
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = 'left'
     
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=False)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     
     tokenizer.padding_side = original_padding_side
@@ -132,11 +132,13 @@ def evaluate_samples(
     tokenizer
 ) -> Dict:
     print(f"\nEvaluating {len(samples)} samples...")
-    
+
+    baseline_module.SYSTEM_PROMPT_REPEAT = 1
+
     is_vllm_model = hasattr(model, '_llm_engine') or (hasattr(model, 'llm_engine') and model.llm_engine is not None)
     effective_batch_size = BATCH_SIZE if is_vllm_model else min(BATCH_SIZE, 4)
     print(f"Batch size: {effective_batch_size} ({'vLLM' if is_vllm_model else 'transformers'})")
-    
+
     prompts = [format_sample_for_inference(sample) for sample in samples]
     all_predictions = []
     all_latencies = []
@@ -168,7 +170,7 @@ def evaluate_samples(
                 'ground_truth': ground_truth,
                 'prediction': prediction,
                 'category': sample.get('category', 'UNKNOWN'),
-                'output_text': output_text[:200],
+                'output_text': output_text,
                 'latency': latency
             })
             all_latencies.append(latency)
@@ -236,7 +238,7 @@ def evaluate_samples(
         'latency_stats': latency_stats,
         'false_positive_rate': fpr,
         'false_negative_rate': fnr,
-        "predictions": all_predictions[:100],
+        "predictions": all_predictions,
     }
     return results
 

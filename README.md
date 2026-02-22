@@ -134,7 +134,7 @@ accelerate launch --config_file fine_tuning/accelerate_fsdp_config.yaml \
 python fine_tuning/train_lora.py --dataset friends --lora-rank 32
 ```
 
-**Options:** `--dataset` (ami | friends | spgi | all). `--lora-rank N` writes to `checkpoints/<model>_r<N>/`. `--max-length 256` (default; use 512 or 1024 for longer context). With `--dataset all`, train/val from ami, friends, and spgi are combined. Balanced SPEAK/SILENT batching is used. After training, a **training curve** is saved as `training_curve.png` in the run directory.
+**Options:** `--dataset` (ami | friends | spgi | all). `--lora-rank N` writes to `checkpoints/<model>_r<N>/`. `--max-length 0` (default) means no truncation; use `--max-length 512` or `1024` only for memory-limited runs (see `fine_tuning/CONSTRAINTS.md`). With `--dataset all`, train/val from ami, friends, and spgi are combined. Balanced SPEAK/SILENT batching is used. After training, a **training curve** is saved as `training_curve.png` in the run directory.
 
 ### 5. Evaluate fine-tuned model
 
@@ -152,8 +152,8 @@ Results are written to `evaluation/results/` (e.g. `finetuned_results_friends_qw
 ## Configuration
 
 - **Dataset:** `DATASET` env or `--dataset` (ami | friends | spgi | **all**). Used by prepare_data, validate_data, evaluate_baseline, fine_tuning, evaluation. For fine-tuning, **all** combines train/val from ami, friends, and spgi into one run.
-- **Model:** `MODEL` env or `--model` in benchmarking (qwen2.5-7b | qwen3-4b-instruct | qwen3-8b | llama3.1-8b-instruct | gpt-oss-20b | mistral-7b-instruct). Defined in `fine_tuning/config.py`; benchmarking and evaluation read the same options. If you set `MODEL`, it must be one of these keys or the process will raise at import (e.g. when starting run_benchmark or train_lora). Omit `MODEL` to use the default (qwen2.5-7b).
-- **System prompt:** Single `SYSTEM_PROMPT` in `benchmarking/evaluate_baseline.py`; repeated 1 or 2 times via `--system-prompt-repeat` (run_benchmark runs both).
+- **Model:** `MODEL` env or `--model` (qwen2.5-7b | qwen3-4b-instruct | qwen3-8b | llama3.1-8b-instruct | gpt-oss-20b | mistral-7b-instruct). Defined in `fine_tuning/config.py`; benchmarking and evaluation use the same options. Default is qwen3-4b-instruct.
+- **System prompt:** Single `SYSTEM_PROMPT` in `benchmarking/evaluate_baseline.py`. Training and fine-tuned evaluation use it once; baseline benchmarking uses `--system-prompt-repeat` 1 or 2 (run_benchmark runs both).
 
 ---
 
@@ -175,3 +175,14 @@ Samples are JSONL with at least:
 - `target_speaker`, `decision` (SPEAK | SILENT), optional `category`, `confidence`.
 
 Training/eval prompt format: system + instruction + context + current utterance → model outputs `<decision>SPEAK|SILENT</decision>` (and optionally reasoning/confidence). See `benchmarking/evaluate_baseline.py` and `fine_tuning/data_loader.py` for the exact prompt layout.
+
+---
+
+## Fine-tuning: memory and compute
+
+Inputs and outputs are **not truncated** by default (`--max-length 0`). For resource-limited runs, use `--max-length 512` or `1024`; see **`fine_tuning/CONSTRAINTS.md`** for:
+
+- DDP vs FSDP vs single-GPU caps (e.g. 22GB GPU, max_length cap 1536 for DDP)
+- Batch size and gradient accumulation when using a max length
+- System prompt usage (training uses prompt once; evaluation uses it twice)
+- Recommended commands for full-context vs memory-limited training

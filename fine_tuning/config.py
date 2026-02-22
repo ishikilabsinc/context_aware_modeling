@@ -30,7 +30,7 @@ DATASET = os.environ.get("DATASET", "ami")
 LORA_CONFIG = {
     "r": 8,
     "lora_alpha": 16,
-    "lora_dropout": 0.1,
+    "lora_dropout": 0.15,
     "target_modules": [
         "q_proj",
         "k_proj", 
@@ -46,21 +46,21 @@ LORA_CONFIG = {
 
 TRAINING_CONFIG = {
     "output_dir": "checkpoints",
-    "num_train_epochs": 1,  # 2-3 often helps if underfitting; 1 is common for LoRA
-    "per_device_train_batch_size": 20,
-    "per_device_eval_batch_size": 8,  # smaller than train to avoid OOM during eval (FSDP)
-    "gradient_accumulation_steps": 2,
-    "learning_rate": 4.5e-4,
+    "num_train_epochs": 1,
+    "per_device_train_batch_size": 4,
+    "per_device_eval_batch_size": 2,
+    "gradient_accumulation_steps": 10,
+    "learning_rate": 2e-4,
     "lr_scheduler_type": "cosine",
     "warmup_steps": 100,
     "logging_steps": 100,
-    "save_steps": 100,  # save mid-epoch so we have a restore point if the run crashes
-    "eval_steps": 50,
+    "save_steps": 100,
+    "eval_steps": 10,
     "save_total_limit": 10,
-    "eval_strategy": "no",  # disabled to avoid eval OOM; run evaluation after training
+    "eval_strategy": "steps",  # enable validation for early stopping and best-checkpoint selection
     "save_strategy": "steps",
-    "load_best_model_at_end": False,  # requires eval; use False when eval_strategy is "no"
-    "metric_for_best_model": "accuracy",
+    "load_best_model_at_end": True,
+    "metric_for_best_model": "eval_macro_f1",
     "greater_is_better": True,
     "fp16": False,
     "bf16": True,
@@ -71,6 +71,8 @@ TRAINING_CONFIG = {
     "dataloader_num_workers": 4,
     "dataloader_pin_memory": True,
     "remove_unused_columns": False,
+    "ddp_find_unused_parameters": False,
+    "silent_ratio_in_batch": 0.5,
 }
 
 

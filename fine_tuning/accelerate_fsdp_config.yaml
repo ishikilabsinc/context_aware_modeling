@@ -1,6 +1,7 @@
 # Example Accelerate config for FSDP (Fully Sharded Data Parallel) training.
 # Use with: accelerate launch --config_file fine_tuning/accelerate_fsdp_config.yaml fine_tuning/train_lora.py --fsdp --dataset all
 # Adjust num_processes to your number of GPUs. If needed, add fsdp_transformer_layer_cls_to_wrap for your model (e.g. Qwen2DecoderLayer).
+# For faster startup with small models (e.g. 4B) that fit on one GPU, use accelerate_ddp_config.yaml and run without --fsdp.
 
 compute_environment: LOCAL_MACHINE
 debug: false
@@ -10,7 +11,7 @@ fsdp_config:
   fsdp_activation_checkpointing: true
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
   fsdp_backward_prefetch: BACKWARD_PRE
-  fsdp_cpu_ram_efficient_loading: true
+  fsdp_cpu_ram_efficient_loading: false
   fsdp_forward_prefetch: false
   fsdp_offload_params: false
   fsdp_sharding_strategy: FULL_SHARD
@@ -21,7 +22,7 @@ machine_rank: 0
 main_training_function: main
 mixed_precision: bf16
 num_machines: 1
-num_processes: 4  # use all 4 GPUs; set to your actual GPU count
+num_processes: 8  # use all 8 GPUs; set to your actual GPU count
 rdzv_backend: static
 same_network: true
 use_cpu: false

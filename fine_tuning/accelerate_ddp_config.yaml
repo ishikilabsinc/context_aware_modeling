@@ -1,0 +1,18 @@
+# Multi-GPU training with DDP (one full model per GPU).
+# Use for models that fit on a single GPU (e.g. Qwen3-4B ~8GB bf16); loading is parallel and much faster than FSDP.
+# Use with: accelerate launch --config_file fine_tuning/accelerate_ddp_config.yaml fine_tuning/train_lora.py --dataset all --lora-rank 32
+# Do NOT pass --fsdp.
+
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: MULTI_GPU
+downcast_bf16: "no"
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+use_cpu: false
