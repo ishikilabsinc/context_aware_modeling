@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""
-LoRA fine-tuning for context-aware turn-taking.
-
-- Normal run: trains and saves the PEFT adapter to checkpoints/<model>_r<N>/final_model/
-  (with FSDP, adapter is saved at the end after gathering full state).
-- If training was interrupted or final_model is missing: use --resume-from-checkpoint
-  pointing at a checkpoint dir (e.g. .../checkpoint-1008). The script loads that checkpoint,
-  does zero new steps, and saves the adapter to final_model. Same command as training,
-  with --resume-from-checkpoint added.
-"""
+"""LoRA fine-tuning for context-aware turn-taking. Saves adapter to checkpoints/<model>_r<N>/final_model/. Use --resume-from-checkpoint to resume or save adapter from a checkpoint."""
 
 import argparse
 import importlib
@@ -18,7 +9,6 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Avoid tokenizer fork warning when DataLoader spawns workers (set before any tokenizer use)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -40,13 +30,8 @@ import torch
 
 
 def setup_model_and_tokenizer(lora_rank=None, use_fsdp=False, local_rank=-1):
-    """lora_rank: if set, overrides LORA_CONFIG['r'] for this run (e.g. 32 or 64).
-    use_fsdp: if True, load model on CPU so FSDP can shard across GPUs (use with accelerate launch).
-    local_rank: when >= 0 (DDP), load model onto cuda:local_rank so Accelerator can train; avoids device_map='auto' in distributed.
-    """
     from config import LORA_CONFIG, BASE_MODEL
     r = lora_rank if lora_rank is not None else LORA_CONFIG["r"]
-    # DDP: one GPU per process; FSDP: CPU then shard; single-GPU: auto
     if use_fsdp:
         device_map = "cpu"
         low_cpu = True
@@ -144,13 +129,11 @@ def setup_model_and_tokenizer(lora_rank=None, use_fsdp=False, local_rank=-1):
 
 
 def _make_compute_metrics(tokenizer):
-    """Build compute_metrics that uses tokenizer to find decision token and compute accuracy, macro F1, balanced accuracy.
-    Accepts predictions as full logits [N,L,V], pred_tokens [N,L], or 1D class indices [N] (0=SILENT, 1=SPEAK) from our custom prediction_step."""
     import numpy as np
     speak_ids = tokenizer.encode("SPEAK", add_special_tokens=False)
     silent_ids = tokenizer.encode("SILENT", add_special_tokens=False)
-    speak_id = int(speak_ids[0]) if speak_ids else -1
-    silent_id = int(silent_ids[0]) if silent_ids else -1
+    speak_id = int(speak_ids[1]) if len(speak_ids) >= 2 else (int(speak_ids[-1]) if speak_ids else -1)
+    silent_id = int(silent_ids[1]) if len(silent_ids) >= 2 else (int(silent_ids[-1]) if silent_ids else -1)
 
     def compute_metrics(eval_pred):
         if hasattr(eval_pred, "predictions"):
@@ -160,12 +143,10 @@ def _make_compute_metrics(tokenizer):
         labels = np.asarray(labels)
         pred_arr = np.asarray(predictions)
         n = labels.shape[0]
-        # 1D predictions and 1D labels: from our custom prediction_step (0/1 per sample); DDP gathers these correctly
         if pred_arr.ndim == 1 and labels.ndim == 1 and len(labels) == len(pred_arr):
             y_pred = pred_arr.ravel()
             y_true = labels.ravel().astype(np.int64)
         elif pred_arr.ndim == 1:
-            # Legacy: 2D labels, extract y_true from decision position
             y_pred = pred_arr.ravel()
             seq_len = labels.shape[1]
             y_true = []
@@ -232,8 +213,6 @@ def _make_compute_metrics(tokenizer):
 
 
 class EvalSummaryCallback(TrainerCallback):
-    """Prints one line per eval: step, train loss, eval loss, eval accuracy."""
-
     def __init__(self):
         self.last_train_loss = None
 
@@ -244,7 +223,6 @@ class EvalSummaryCallback(TrainerCallback):
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         if metrics is None:
             return
-        # Print only on rank 0 to avoid duplicate lines under DDP
         if os.environ.get("LOCAL_RANK", "0") != "0":
             return
         step = state.global_step
@@ -256,11 +234,95 @@ class EvalSummaryCallback(TrainerCallback):
         print(f"  [check] Step {step} | train_loss={train_loss} | eval_loss={eval_loss} | eval_acc={eval_acc} | macro_f1={eval_macro_f1} | balanced_acc={eval_bal_acc}")
 
 
-class TrainerWithBalancedBatches(Trainer):
-    """Trainer that uses a custom train dataloader with balanced SPEAK/SILENT batches when provided.
-    Overrides prediction_step to return only decision-token class (0/1) per sample instead of full logits,
-    so evaluation does not OOM when concatenating predictions over 20k+ val samples."""
+class LogTargetVsPredictedCallback(TrainerCallback):
+    def __init__(self, n_samples=4):
+        self.n_samples = n_samples
 
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        trainer = getattr(self, "trainer", None)
+        if trainer is None or metrics is None:
+            return
+        tokenizer = getattr(trainer, "_tokenizer", None)
+        speak_id = getattr(trainer, "_speak_id", None)
+        silent_id = getattr(trainer, "_silent_id", None)
+        if tokenizer is None or speak_id is None or silent_id is None:
+            return
+
+        local_rank = os.environ.get("LOCAL_RANK", "0")
+        is_rank0 = local_rank == "0"
+        out_path = Path(trainer.args.output_dir) / "target_vs_predicted.txt"
+        err_path = Path(trainer.args.output_dir) / "target_vs_predicted_err.txt"
+        step = state.global_step
+
+        try:
+            device = getattr(getattr(trainer, "accelerator", None), "device", None)
+            if device is None:
+                try:
+                    device = next(trainer.model.parameters()).device
+                except (StopIteration, Exception):
+                    device = torch.device("cuda", int(local_rank)) if torch.cuda.is_available() else torch.device("cpu")
+        except Exception:
+            device = torch.device("cuda", int(local_rank)) if local_rank.isdigit() and torch.cuda.is_available() else torch.device("cpu")
+
+        try:
+            lines = [f"\n{'='*60}", f"Step {step}", f"{'='*60}"]
+            for split_name, dataset in [("train", trainer.train_dataset), ("val", trainer.eval_dataset)]:
+                if dataset is None or len(dataset) == 0:
+                    continue
+                n = min(self.n_samples, len(dataset))
+                lines.append(f"\n--- {split_name.upper()} (first {n} samples) ---")
+                items = [dataset[i] for i in range(n)]
+                batch = trainer.data_collator(items)
+                batch = {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
+                with torch.no_grad():
+                    outputs = trainer.model(**batch)
+                logits = outputs.logits
+                labels = batch["labels"]
+                B, L, V = logits.shape
+                for i in range(B):
+                    pos = None
+                    for j in range(L - 1, -1, -1):
+                        if labels[i, j].item() in (speak_id, silent_id):
+                            pos = j
+                            break
+                    if pos is None:
+                        target_str = "?"
+                        pred_str = "?"
+                    else:
+                        target_str = "SPEAK" if labels[i, pos].item() == speak_id else "SILENT"
+                        if speak_id < V and silent_id < V:
+                            pred_str = "SPEAK" if logits[i, pos, speak_id].item() >= logits[i, pos, silent_id].item() else "SILENT"
+                        else:
+                            pred_str = "?"
+                    ok = "ok" if target_str == pred_str else "wrong"
+                    lines.append(f"  sample {i}: target={target_str}  predicted={pred_str}  {ok}")
+            lines.append("")
+
+            if is_rank0:
+                write_header = not out_path.exists()
+                with open(out_path, "a", encoding="utf-8") as f:
+                    if write_header:
+                        f.write("Target vs predicted for first few train/val samples (appended after each eval).\n")
+                    f.write("\n".join(lines))
+                if step == args.eval_steps:
+                    print(f"  [target_vs_predicted] Appended step {step} to {out_path}")
+        except Exception as e:
+            import traceback
+            err_msg = f"Step {step}: {e}\n{traceback.format_exc()}"
+            if is_rank0:
+                try:
+                    with open(err_path, "a", encoding="utf-8") as f:
+                        f.write(err_msg)
+                    if not out_path.exists():
+                        with open(out_path, "w", encoding="utf-8") as f:
+                            f.write(f"Error (see {err_path.name}): {e}\n")
+                except Exception:
+                    print(f"  [target_vs_predicted] Error: {e}")
+                else:
+                    print(f"  [target_vs_predicted] Error (see {err_path}): {e}")
+
+
+class TrainerWithBalancedBatches(Trainer):
     def __init__(self, train_batch_sampler=None, tokenizer=None, **kwargs):
         super().__init__(**kwargs)
         self.train_batch_sampler = train_batch_sampler
@@ -270,21 +332,19 @@ class TrainerWithBalancedBatches(Trainer):
         if tokenizer is not None:
             speak_ids = tokenizer.encode("SPEAK", add_special_tokens=False)
             silent_ids = tokenizer.encode("SILENT", add_special_tokens=False)
-            self._speak_id = int(speak_ids[0]) if speak_ids else -1
-            self._silent_id = int(silent_ids[0]) if silent_ids else -1
+            self._speak_id = int(speak_ids[1]) if len(speak_ids) >= 2 else (int(speak_ids[-1]) if speak_ids else -1)
+            self._silent_id = int(silent_ids[1]) if len(silent_ids) >= 2 else (int(silent_ids[-1]) if silent_ids else -1)
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """Run forward, then return (loss, pred_classes, labels) with pred_classes shape [B] to avoid OOM from storing full logits."""
         if self._tokenizer is None or self._speak_id is None or self._silent_id is None:
             return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
         labels = inputs.get("labels")
         with torch.no_grad():
             outputs = model(**inputs)
             loss = outputs.loss if outputs.loss is not None else None
-            logits = outputs.logits  # [B, L, V]
+            logits = outputs.logits
         if prediction_loss_only or logits is None or labels is None:
             return (loss, None, None)
-        # Move to same device for indexing
         labels = labels.to(logits.device)
         B, L, V = logits.shape
         speak_id = self._speak_id
@@ -302,12 +362,10 @@ class TrainerWithBalancedBatches(Trainer):
                 true_classes.append(0)
                 continue
             true_classes.append(1 if labels[i, pos].item() == speak_id else 0)
-            # 1 = SPEAK if logits[i,pos,speak_id] >= logits[i,pos,silent_id] else 0 = SILENT
             if speak_id >= 0 and silent_id >= 0 and speak_id < V and silent_id < V:
                 pred_classes.append(1 if logits[i, pos, speak_id].item() >= logits[i, pos, silent_id].item() else 0)
             else:
                 pred_classes.append(0)
-        # Return 1D tensors so DDP gathers them correctly; 2D labels were causing single-class eval bug
         out = torch.tensor(pred_classes, dtype=torch.long, device=logits.device)
         labels_out = torch.tensor(true_classes, dtype=torch.long, device=logits.device)
         return (loss, out, labels_out)
@@ -333,6 +391,9 @@ def main(
     val_fraction: float = 1.0,
     resume_from_checkpoint: Optional[str] = None,
     debug: bool = False,
+    training_mode: str = "decision_only",
+    equal_sampling: bool = False,
+    filter_no_context: bool = True,
 ):
     os.environ["DATASET"] = dataset
     if "config" in sys.modules:
@@ -348,20 +409,25 @@ def main(
         VAL_FILE,
         MODEL,
     )
-    from data_loader import prepare_datasets, make_data_collator
+    from data_loader import prepare_datasets, make_data_collator, TRAINING_MODE_DECISION_ONLY, TRAINING_MODE_COT, TRAINING_MODES
 
-    # When using a custom LoRA rank, save to a separate dir so runs don't overwrite (e.g. checkpoints/qwen2.5-7b_r32)
-    if lora_rank is not None:
-        run_output_dir = Path(__file__).resolve().parent / "checkpoints" / f"{MODEL}_r{lora_rank}"
-        run_final_model_dir = run_output_dir / "final_model"
-        run_output_dir.mkdir(parents=True, exist_ok=True)
+    if training_mode not in TRAINING_MODES:
+        raise ValueError(f"training_mode must be one of {TRAINING_MODES}, got {training_mode!r}")
+
+    base_run_name = f"{MODEL}_r{lora_rank}" if lora_rank is not None else MODEL
+    if training_mode == TRAINING_MODE_COT:
+        run_name = f"{base_run_name}_cot"
     else:
-        run_output_dir = OUTPUT_DIR
-        run_final_model_dir = FINAL_MODEL_DIR
+        run_name = base_run_name
+
+    run_output_dir = Path(__file__).resolve().parent / "checkpoints" / run_name
+    run_final_model_dir = run_output_dir / "final_model"
+    run_output_dir.mkdir(parents=True, exist_ok=True)
 
     print("="*70)
     print(f"LORA FINE-TUNING FOR CONTEXT-AWARE TURN-TAKING")
     print(f"Dataset: {DATASET}")
+    print(f"Training mode: {training_mode}")
     if lora_rank is not None:
         print(f"LoRA rank: {lora_rank} (output: {run_output_dir})")
     if use_fsdp:
@@ -372,6 +438,8 @@ def main(
         print(f"Max sequence length: {max_length} (optional cap for memory; use --max-length 0 for no truncation)")
     if train_fraction < 1.0 or val_fraction < 1.0:
         print(f"Data subset: train_fraction={train_fraction}, val_fraction={val_fraction}")
+    if filter_no_context:
+        print("Filter: excluding samples with no context_turns")
     print("="*70)
 
     # Setup model (use config rank if lora_rank not set; load on CPU if FSDP, else cuda:LOCAL_RANK for DDP)
@@ -390,14 +458,14 @@ def main(
     print("="*70)
     if DATASET == "all":
         print("Train/val: combined from ami, friends, spgi")
+        if equal_sampling:
+            print("Equal sampling: enabled (SPGI subsampled to 11K stratified)")
     else:
         print(f"Train file: {TRAIN_FILE}")
         print(f"Val file: {VAL_FILE}")
 
     batch_size = TRAINING_CONFIG["per_device_train_batch_size"]
     if max_length is None or max_length <= 0:
-        batch_size = 1
-    elif not use_fsdp and local_rank >= 0 and max_length >= 512:
         batch_size = 1
     debug = debug or (os.environ.get("DEBUG_TRAINING", "false").lower() == "true")
     rank = None
@@ -421,9 +489,11 @@ def main(
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         debug_sample_io_path=str(run_output_dir / "debug_sample_io.txt") if debug else None,
+        training_mode=training_mode,
+        equal_sampling=equal_sampling,
+        filter_no_context=filter_no_context,
     )
 
-    # Training arguments
     print("\n" + "="*70)
     print("SETTING UP TRAINING")
     print("="*70)
@@ -432,12 +502,14 @@ def main(
     if use_fsdp:
         training_config["fsdp"] = ["full_shard"]
         training_config["gradient_checkpointing"] = False
-    elif local_rank >= 0:
-        training_config["gradient_checkpointing"] = False
-        if max_length is None or max_length <= 0 or max_length >= 512:
+        if max_length is None or max_length <= 0:
             training_config["per_device_train_batch_size"] = 1
             training_config["gradient_accumulation_steps"] = max(training_config["gradient_accumulation_steps"], 40)
-    # Fused optimizer requires CUDA; fall back to avoid errors on CPU / unsupported envs
+    elif local_rank >= 0:
+        training_config["gradient_checkpointing"] = False
+        if max_length is None or max_length <= 0:
+            training_config["per_device_train_batch_size"] = 1
+            training_config["gradient_accumulation_steps"] = max(training_config["gradient_accumulation_steps"], 40)
     if training_config.get("optim") == "adamw_torch_fused" and not torch.cuda.is_available():
         training_config["optim"] = "adamw_torch"
 
@@ -449,7 +521,7 @@ def main(
             trainer_state = json.load(f)
         global_step = trainer_state.get("global_step", 0)
         training_config["max_steps"] = global_step
-        training_config["load_best_model_at_end"] = False  # keep resumed checkpoint, don't switch to "best"
+        training_config["load_best_model_at_end"] = False
         print(f"Resume from {resume_from_checkpoint} (global_step={global_step}); will load then save adapter (no new steps).")
 
     training_args = TrainingArguments(
@@ -464,7 +536,6 @@ def main(
     print(f"Effective batch size: {training_config['per_device_train_batch_size'] * training_config['gradient_accumulation_steps']}")
     print(f"Learning rate: {training_config['learning_rate']}")
     
-    # Collator: when max_length is 0 we do not truncate; pad to longest in batch only.
     if max_length is None or max_length <= 0:
         collator_cap = 2**20
     else:
@@ -472,7 +543,7 @@ def main(
     data_collator_obj = make_data_collator(tokenizer, max_length_cap=collator_cap)
 
     compute_metrics_fn = _make_compute_metrics(tokenizer)
-    callbacks = [EvalSummaryCallback()]
+    callbacks = [EvalSummaryCallback(), LogTargetVsPredictedCallback(n_samples=4)]
     if (
         training_config.get("eval_strategy") != "no"
         and not resume_from_checkpoint
@@ -491,14 +562,15 @@ def main(
         tokenizer=tokenizer,
         callbacks=callbacks,
     )
-    
+    if hasattr(trainer.model, "gradient_checkpointing_disable"):
+        trainer.model.gradient_checkpointing_disable()
+
     print("\n" + "="*70)
     print("STARTING TRAINING")
     print("="*70)
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
-    # Plot training curve (loss / eval loss / lr) for stability inspection
     try:
         from plot_training_curve import plot_training_curve
         plot_training_curve(
@@ -583,6 +655,30 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable debug (print full sample I/O for a few train/val examples). Also enabled by DEBUG_TRAINING=true.",
     )
+    parser.add_argument(
+        "--training-mode",
+        type=str,
+        default="decision_only",
+        choices=["decision_only", "cot"],
+        help="Training mode: decision_only (response = <decision>SPEAK|SILENT</decision> only) or cot (chain-of-thought; not yet implemented). Checkpoints are saved to mode-specific dirs (e.g. ..._cot) so modes do not overwrite each other.",
+    )
+    parser.add_argument(
+        "--equal-sampling",
+        action="store_true",
+        help="When dataset=all: subsample SPGI to 11K (stratified 50/50 SPEAK/SILENT, category-proportional). AMI and Friends kept as-is. Total ~32.5K, ~1 epoch = ~1,015 steps.",
+    )
+    parser.add_argument(
+        "--filter-no-context",
+        action="store_true",
+        default=True,
+        help="Exclude samples with no context_turns from train and val (default: True).",
+    )
+    parser.add_argument(
+        "--no-filter-no-context",
+        action="store_false",
+        dest="filter_no_context",
+        help="Do not filter; include samples with no context_turns.",
+    )
     args = parser.parse_args()
     main(
         dataset=args.dataset,
@@ -593,4 +689,7 @@ if __name__ == "__main__":
         val_fraction=args.val_fraction,
         resume_from_checkpoint=args.resume_from_checkpoint,
         debug=args.debug,
+        training_mode=args.training_mode,
+        equal_sampling=args.equal_sampling,
+        filter_no_context=args.filter_no_context,
     )

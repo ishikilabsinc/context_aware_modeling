@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-Load and format training/val data for LoRA fine-tuning. Uses config for paths.
-Prompt format matches benchmarking/evaluate_baseline.py. Training objective: causal LM
-with loss only on the decision token (SPEAK or SILENT) in the answer block.
-"""
+"""Load and format training/val data for LoRA fine-tuning. Supports two modes: decision_only (response = <decision>SPEAK|SILENT</decision>) and cot (response = <reasoning>...</reasoning> + <decision>...</decision> + <confidence>...). CoT uses train_samples_with_reasoning.jsonl when present (see generate_reasoning.py)."""
 
 import sys
 from pathlib import Path
@@ -13,7 +9,14 @@ import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
-from config import TRAIN_FILE, VAL_FILE, DATASET, BASE_DIR
+try:
+    from .config import TRAIN_FILE, VAL_FILE, DATASET, BASE_DIR
+except ImportError:
+    from config import TRAIN_FILE, VAL_FILE, DATASET, BASE_DIR
+
+TRAINING_MODE_DECISION_ONLY = "decision_only"
+TRAINING_MODE_COT = "cot"
+TRAINING_MODES = [TRAINING_MODE_DECISION_ONLY, TRAINING_MODE_COT]
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -21,7 +24,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 
 def _get_system_prompt_for_training() -> str:
-    """Same SYSTEM_PROMPT as benchmarking; used once so more tokens remain for context."""
     from benchmarking.evaluate_baseline import SYSTEM_PROMPT
     return SYSTEM_PROMPT.strip()
 
@@ -36,7 +38,6 @@ def _build_context_str_benchmark_style(
     tokenizer,
     max_tokens: int,
 ) -> str:
-    """Build context string in benchmarking format; selects turns from the end to fit within max_tokens when max_tokens > 0."""
     all_turns = context_turns + ([current_turn] if current_turn else [])
     if not all_turns:
         return "(No previous context)"
@@ -59,42 +60,42 @@ def _build_context_str_benchmark_style(
     return "\n".join(line for _, line in selected)
 
 
-def create_training_prompt(sample: Dict, tokenizer, max_length: int = None) -> str:
-    """Build prompt in same format as benchmark format_sample_for_inference.
-    If max_length is 0 or None, use full context (no truncation)."""
+def create_training_prompt(sample: Dict, tokenizer, max_length: int = None, training_mode: str = TRAINING_MODE_DECISION_ONLY) -> str:
+    if training_mode not in TRAINING_MODES:
+        raise ValueError(f"training_mode must be one of {TRAINING_MODES}, got {training_mode!r}")
+
     system_prompt = _get_system_prompt_for_training()
     context_turns = sample.get("context_turns", [])
     current_turn = sample.get("current_turn", {})
     target_speaker = sample.get("target_speaker", "?")
-    decision = sample.get("decision", "UNKNOWN")
-    if decision not in ("SPEAK", "SILENT"):
-        decision = "SILENT" if decision.upper() == "SILENT" else "SPEAK"
-    confidence = sample.get("confidence", "medium")
-    reason = sample.get("reason", "")
 
     instruction = (
         f"You are playing the role of Speaker {target_speaker}. The conversation history above shows all utterances including the most recent one (marked as [MOST RECENT]). "
-        "After that most recent utterance, there was a pause. Decide if you (Speaker {target_speaker}) should START TALKING or STAY SILENT now."
+        f"After that most recent utterance, there was a pause. Decide if you (Speaker {target_speaker}) should START TALKING or STAY SILENT now."
     )
     if current_turn:
         current_str = f"Speaker {current_turn.get('speaker', '?')}: {current_turn.get('text', '')}"
     else:
         current_str = "(No current utterance)"
 
-    reply_format = (
-        "Reply with your decision in this exact format: <reasoning>One sentence: ACTIVE PARTICIPANT or BYSTANDER, and who is addressed.</reasoning> "
-        "<decision>SPEAK</decision> or <decision>SILENT</decision> <confidence>high</confidence> or <confidence>medium</confidence> or <confidence>low</confidence>"
-    )
-    output_part = f"<reasoning>{reason}</reasoning> <decision>{decision}</decision> <confidence>{confidence}</confidence>"
+    if training_mode == TRAINING_MODE_DECISION_ONLY:
+        reply_format = (
+            "Reply with your decision in this exact format: <decision>SPEAK</decision> or <decision>SILENT</decision>"
+        )
+        output_part = "<decision>SPEAK</decision>"
+    else:
+        reply_format = (
+            "Reply with: <reasoning>one sentence explaining why</reasoning>\n<decision>SPEAK or SILENT</decision>\n<confidence>high, medium, or low</confidence>"
+        )
+        output_part = "<reasoning>Placeholder.</reasoning>\n<decision>SPEAK</decision>\n<confidence>high</confidence>"
 
+    output_tokens = estimate_tokens(output_part, tokenizer)
     system_tokens = estimate_tokens(system_prompt, tokenizer)
     instruction_tokens = estimate_tokens(instruction, tokenizer)
     current_block = f"MOST RECENT UTTERANCE (the previous utterance that just occurred): {current_str}"
     current_tokens = estimate_tokens(current_block, tokenizer)
     reply_tokens = estimate_tokens(reply_format, tokenizer)
-    output_tokens = estimate_tokens(output_part, tokenizer)
     reserved = system_tokens + instruction_tokens + current_tokens + reply_tokens + output_tokens + 150
-    # No truncation: use full context when max_length is 0 or None
     available_context = 10**6 if (max_length is None or max_length <= 0) else max(0, max_length - reserved)
     context_str = _build_context_str_benchmark_style(
         context_turns, current_turn, tokenizer, available_context
@@ -104,96 +105,180 @@ def create_training_prompt(sample: Dict, tokenizer, max_length: int = None) -> s
 <|instruction|>{instruction}<|/instruction|>
 <|context|>{context_str}<|/context|>
 <|current|>MOST RECENT UTTERANCE (the previous utterance that just occurred): {current_str}<|/current|>
-{reply_format}
-<reasoning>{reason}</reasoning> <decision>{decision}</decision> <confidence>{confidence}</confidence>"""
+{reply_format}"""
     return prompt
 
 
 class TurnTakingDataset(Dataset):
-    def __init__(self, samples: List[Dict], tokenizer: AutoTokenizer, max_length: int = 2048, debug: bool = False):
+    def __init__(self, samples: List[Dict], tokenizer: AutoTokenizer, max_length: int = 2048, debug: bool = False, training_mode: str = TRAINING_MODE_DECISION_ONLY):
         self.samples = samples
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.debug = debug
-        # No truncation: use full example (variable-length batches; collator will pad)
+        self.training_mode = training_mode
         self.no_truncation = max_length is None or max_length <= 0
 
     def __len__(self):
         return len(self.samples)
-    
-    def __getitem__(self, idx):
+
+    def _getitem_decision_only(self, idx):
         sample = self.samples[idx]
-        
-        prompt = create_training_prompt(sample, self.tokenizer, self.max_length)
-        
+        decision = sample.get("decision", "SILENT")
+        if decision not in ("SPEAK", "SILENT"):
+            decision = "SILENT" if str(decision).upper() == "SILENT" else "SPEAK"
+        response_str = "<decision>SPEAK</decision>" if decision == "SPEAK" else "<decision>SILENT</decision>"
+        prompt = create_training_prompt(sample, self.tokenizer, self.max_length, training_mode=TRAINING_MODE_DECISION_ONLY)
+        prompt_content = prompt.rstrip()
+        full_text = prompt_content + "\n" + response_str
+        response_start_char = len(prompt_content) + 1
+
         if self.no_truncation:
-            # Full example: no truncation, no padding (collator pads to longest in batch)
             encoding = self.tokenizer(
-                prompt,
+                full_text,
                 truncation=False,
                 return_tensors="pt",
+                return_offsets_mapping=True,
             )
             input_ids = encoding["input_ids"].flatten().clone()
             attention_mask = encoding["attention_mask"].flatten().clone()
+            offset_mapping = encoding.get("offset_mapping")
+            offset_mapping = offset_mapping.flatten(0, 1) if offset_mapping is not None else None
         else:
-            # Truncate from the left so the answer block at the end is always kept.
-            # truncation_side is set on the tokenizer (not all transformers versions accept it as a kwarg).
             old_side = getattr(self.tokenizer, "truncation_side", "right")
             self.tokenizer.truncation_side = "left"
             try:
                 encoding = self.tokenizer(
-                    prompt,
+                    full_text,
                     truncation=True,
                     max_length=self.max_length,
                     padding="max_length",
                     return_tensors="pt",
+                    return_offsets_mapping=True,
                 )
             finally:
                 self.tokenizer.truncation_side = old_side
             input_ids = encoding["input_ids"].flatten().clone()
             attention_mask = encoding["attention_mask"].flatten().clone()
-        # Decision-token-only loss: only the SPEAK/SILENT token position gets a non-ignore label.
-        # Pinpoint the *answer* block (last "<reasoning>...</reasoning> <decision>SPEAK|SILENT</decision>")
-        # so we never use the format line's SPEAK/SILENT (which would make every sample one class).
-        speak_ids = self.tokenizer.encode("SPEAK", add_special_tokens=False)
-        silent_ids = self.tokenizer.encode("SILENT", add_special_tokens=False)
-        speak_id = int(speak_ids[0]) if speak_ids else -1
-        silent_id = int(silent_ids[0]) if silent_ids else -1
-        open_reasoning_ids = self.tokenizer.encode("<reasoning>", add_special_tokens=False)
-        open_reasoning_first_id = int(open_reasoning_ids[0]) if open_reasoning_ids else -1
-        end_reasoning_ids = self.tokenizer.encode("</reasoning>", add_special_tokens=False)
-        end_reasoning_last_id = int(end_reasoning_ids[-1]) if end_reasoning_ids else -1
-        labels = torch.full_like(input_ids, -100, dtype=torch.long)
-        # Answer block = after the last "<reasoning>" (format has one, answer has one; we want the answer)
-        answer_start = -1
-        for j in range(input_ids.shape[0] - 1, -1, -1):
-            if input_ids[j].item() == open_reasoning_first_id:
-                answer_start = j
-                break
-        start_after = 0
-        if answer_start >= 0:
-            for j in range(answer_start, input_ids.shape[0]):
-                if input_ids[j].item() == end_reasoning_last_id:
-                    start_after = j + 1
-                    break
-        for j in range(start_after, input_ids.shape[0]):
-            tok = input_ids[j].item()
-            if tok == speak_id or tok == silent_id:
-                labels[j] = tok
-                break
-        else:
-            # Fallback: answer truncated; use last occurrence (may be format line)
-            for j in range(input_ids.shape[0] - 1, -1, -1):
-                tok = input_ids[j].item()
-                if tok == speak_id or tok == silent_id:
-                    labels[j] = tok
-                    break
+            offset_mapping = encoding.get("offset_mapping")
+            offset_mapping = offset_mapping.flatten(0, 1) if offset_mapping is not None else None
 
+        labels = torch.full_like(input_ids, -100, dtype=torch.long)
+        if offset_mapping is not None:
+            for i in range(offset_mapping.shape[0]):
+                s, e = offset_mapping[i].tolist()
+                if s == 0 and e == 0:
+                    continue
+                if s >= response_start_char:
+                    labels[i] = input_ids[i].item()
+        else:
+            n_prompt = len(self.tokenizer.encode(prompt_content + "\n", add_special_tokens=True))
+            response_start_idx = min(n_prompt, input_ids.shape[0])
+            labels[response_start_idx:] = input_ids[response_start_idx:].clone()
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
         }
+
+    def _getitem_cot(self, idx):
+        sample = self.samples[idx]
+        decision = sample.get("decision", "SILENT")
+        if decision not in ("SPEAK", "SILENT"):
+            decision = "SILENT" if str(decision).upper() == "SILENT" else "SPEAK"
+        reasoning = sample.get("reasoning", "No reasoning provided.").strip()
+        if not reasoning:
+            reasoning = "No reasoning provided."
+        confidence = sample.get("confidence", "medium")
+        if confidence not in ("high", "medium", "low"):
+            confidence = "medium"
+        response_str = f"<reasoning>{reasoning}</reasoning>\n<decision>{decision}</decision>\n<confidence>{confidence}</confidence>"
+        prompt = create_training_prompt(sample, self.tokenizer, self.max_length, training_mode=TRAINING_MODE_COT)
+        prompt_content = prompt.rstrip()
+        full_text = prompt_content + "\n" + response_str
+        response_start_char = len(prompt_content) + 1
+
+        if self.no_truncation:
+            encoding = self.tokenizer(
+                full_text,
+                truncation=False,
+                return_tensors="pt",
+                return_offsets_mapping=True,
+            )
+            input_ids = encoding["input_ids"].flatten().clone()
+            attention_mask = encoding["attention_mask"].flatten().clone()
+            offset_mapping = encoding.get("offset_mapping")
+            offset_mapping = offset_mapping.flatten(0, 1) if offset_mapping is not None else None
+        else:
+            old_side = getattr(self.tokenizer, "truncation_side", "right")
+            self.tokenizer.truncation_side = "left"
+            try:
+                encoding = self.tokenizer(
+                    full_text,
+                    truncation=True,
+                    max_length=self.max_length,
+                    padding="max_length",
+                    return_tensors="pt",
+                    return_offsets_mapping=True,
+                )
+            finally:
+                self.tokenizer.truncation_side = old_side
+            input_ids = encoding["input_ids"].flatten().clone()
+            attention_mask = encoding["attention_mask"].flatten().clone()
+            offset_mapping = encoding.get("offset_mapping")
+            offset_mapping = offset_mapping.flatten(0, 1) if offset_mapping is not None else None
+
+        labels = torch.full_like(input_ids, -100, dtype=torch.long)
+        if offset_mapping is not None:
+            for i in range(offset_mapping.shape[0]):
+                s, e = offset_mapping[i].tolist()
+                if s == 0 and e == 0:
+                    continue
+                if s >= response_start_char:
+                    labels[i] = input_ids[i].item()
+        else:
+            n_prompt = len(self.tokenizer.encode(prompt_content + "\n", add_special_tokens=True))
+            response_start_idx = min(n_prompt, input_ids.shape[0])
+            labels[response_start_idx:] = input_ids[response_start_idx:].clone()
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+    def __getitem__(self, idx):
+        if self.training_mode == TRAINING_MODE_DECISION_ONLY:
+            return self._getitem_decision_only(idx)
+        if self.training_mode == TRAINING_MODE_COT:
+            return self._getitem_cot(idx)
+        raise ValueError(f"training_mode must be one of {TRAINING_MODES}, got {self.training_mode!r}")
+
+
+def verify_response_boundary(
+    tokenizer: AutoTokenizer,
+    dataset: "TurnTakingDataset",
+    num_samples: int = 3,
+) -> tuple:
+    errors = []
+    for idx in range(min(num_samples, len(dataset))):
+        item = dataset[idx]
+        labels = item["labels"]
+        input_ids = item["input_ids"]
+        label_positions = (labels != -100).nonzero(as_tuple=True)[0]
+        if label_positions.numel() == 0:
+            errors.append(f"Sample {idx}: no unmasked tokens")
+            continue
+        start_pos = int(label_positions[0].item())
+        # Decode first few response tokens to check they form "<decision>..."
+        num_tokens = min(12, labels.shape[0] - start_pos)
+        token_ids = [int(input_ids[start_pos + i].item()) for i in range(num_tokens)]
+        decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
+        decoded_stripped = decoded.strip()
+        if not (decoded_stripped.startswith("<decision>") or decoded_stripped.startswith("<decision") or decoded_stripped.startswith("<")):
+            errors.append(
+                f"Sample {idx}: first unmasked token(s) at pos {start_pos} decode to {decoded!r}; "
+                f"expected to start with '<' (start of <decision>)"
+            )
+    return (len(errors) == 0, errors)
 
 
 def _write_sample_inputs_outputs(
@@ -205,18 +290,18 @@ def _write_sample_inputs_outputs(
     max_length: int,
     filepath: Path,
     n_per_split: int = 4,
+    training_mode: str = TRAINING_MODE_DECISION_ONLY,
 ) -> None:
-    """Write full model input and target (label) for a few train/val samples to a file.
-    Includes truncation info so you can see how max_length affects training."""
     filepath = Path(filepath)
     filepath.parent.mkdir(parents=True, exist_ok=True)
     no_truncation = max_length is None or max_length <= 0
     with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"training_mode = {training_mode}\n")
         if no_truncation:
             f.write("max_length = None (no truncation; full examples)\n")
         else:
             f.write(f"max_length = {max_length}\n")
-        f.write("Each sample shows: full tokenized input (what the model sees), target (the single token we train on: SPEAK or SILENT), and whether the prompt was truncated.\n")
+        f.write("Each sample shows: full tokenized input (what the model sees), target (response tokens; prompt tokens masked with -100), and whether the prompt was truncated.\n")
         f.write("=" * 80 + "\n\n")
         for name, dataset, samples in [
             ("TRAIN", train_dataset, train_samples),
@@ -225,7 +310,7 @@ def _write_sample_inputs_outputs(
             n = min(n_per_split, len(samples))
             for i in range(n):
                 sample = samples[i]
-                prompt_text = create_training_prompt(sample, tokenizer, max_length)
+                prompt_text = create_training_prompt(sample, tokenizer, max_length, training_mode=training_mode)
                 full_enc = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=True)
                 n_tokens_before = full_enc["input_ids"].shape[1]
                 truncated = False if no_truncation else (n_tokens_before > max_length)
@@ -235,39 +320,109 @@ def _write_sample_inputs_outputs(
                 full_text = tokenizer.decode(input_ids.tolist(), skip_special_tokens=False)
                 label_positions = (labels != -100).nonzero(as_tuple=True)[0]
                 if label_positions.numel() > 0:
-                    pos = label_positions[0].item()
-                    tok_id = int(labels[pos].item())
-                    tok_str = tokenizer.decode([tok_id])
-                    label_info = f"Position {pos}: {tok_str!r} (id={tok_id})"
+                    start_pos = label_positions[0].item()
+                    end_pos = label_positions[-1].item()
+                    response_tokens = [int(labels[i].item()) for i in range(start_pos, end_pos + 1)]
+                    response_str = tokenizer.decode(response_tokens)
+                    label_info = f"Positions {start_pos}-{end_pos}: {response_str!r} ({label_positions.numel()} response tokens)"
+                    n_show = min(8, label_positions.numel())
+                    first_few = [int(input_ids[start_pos + k].item()) for k in range(n_show)]
+                    first_few_decoded = tokenizer.decode(first_few, skip_special_tokens=False)
+                    boundary_note = f"Boundary check: first unmasked token(s) decoded: {first_few_decoded!r} (expected: start of '<decision>')"
                 else:
                     label_info = "No label position (all -100); answer block may be truncated"
+                    boundary_note = "Boundary check: N/A (no unmasked tokens)"
                 decision = sample.get("decision", "?")
                 f.write(f"\n{'='*80}\n")
                 f.write(f"{name} sample {i}  |  decision={decision}  |  tokens_used={len(input_ids)}  |  tokens_before_truncation={n_tokens_before}  |  truncated={truncated}\n")
                 f.write(f"{'='*80}\n")
-                f.write(f"TARGET (the single token we train on): {label_info}\n")
+                f.write(f"TARGET (response tokens): {label_info}\n")
+                f.write(f"{boundary_note}\n")
                 f.write(f"\nFULL MODEL INPUT (decoded, {len(input_ids)} tokens):\n")
                 f.write("-" * 80 + "\n")
                 f.write(full_text)
                 f.write("\n" + "-" * 80 + "\n")
         f.write("\n" + "=" * 80 + "\n")
+        f.write("BOUNDARY VERIFICATION (first unmasked token should be '<' of <decision>)\n")
+        f.write("-" * 80 + "\n")
+        for name, dataset in [("TRAIN", train_dataset), ("VAL", val_dataset)]:
+            ok, errs = verify_response_boundary(tokenizer, dataset, num_samples=3)
+            if ok:
+                f.write(f"{name}: OK (3 samples checked)\n")
+            else:
+                for e in errs:
+                    f.write(f"{name}: {e}\n")
+        f.write("=" * 80 + "\n")
     print(f"[debug] Full model input/output for {n_per_split} train + {n_per_split} val samples written to: {filepath}")
 
 
 import random
 from torch.utils.data import Sampler
 
-from utils.data_utils import load_samples
+from utils.data_utils import load_samples, filter_samples_with_context
 
 ALL_DATASETS = ["ami", "friends", "spgi"]
 
+# Target sizes for equal sampling (dataset=all): AMI and Friends kept as-is, SPGI subsampled to this.
+EQUAL_SAMPLING_SPGI_TARGET = 11_000
+EQUAL_SAMPLING_SEED = 42
+
+
+def _stratified_subsample_spgi(
+    samples: List[Dict],
+    target_total: int = EQUAL_SAMPLING_SPGI_TARGET,
+    seed: int = EQUAL_SAMPLING_SEED,
+) -> List[Dict]:
+    """Subsample SPGI to target_total preserving 50/50 SPEAK/SILENT and category proportions.
+    Categories: SPEAK_explicit, SPEAK_implicit, SILENT_ref, SILENT_no_ref.
+    """
+    if len(samples) <= target_total:
+        return list(samples)
+    rng = random.Random(seed)
+    speak = [s for s in samples if s.get("decision") == "SPEAK"]
+    silent = [s for s in samples if s.get("decision") == "SILENT"]
+    n_speak_target = target_total // 2
+    n_silent_target = target_total - n_speak_target
+
+    def _stratified_sample(pool: List[Dict], n_want: int) -> List[Dict]:
+        if not pool or n_want <= 0:
+            return []
+        if n_want >= len(pool):
+            return list(pool)
+        total = len(pool)
+        by_cat: Dict[str, List[Dict]] = {}
+        for s in pool:
+            cat = s.get("category") or "unknown"
+            by_cat.setdefault(cat, []).append(s)
+        # Proportional target per category, capped by available
+        sampled: List[Dict] = []
+        for cat, group in by_cat.items():
+            n_cat = min(len(group), max(0, int(round(n_want * len(group) / total))))
+            if n_cat > 0:
+                sampled.extend(rng.sample(group, n_cat))
+        # Fix size: add or remove to reach n_want (preserves approximate balance)
+        if len(sampled) < n_want:
+            remaining = [s for s in pool if s not in sampled]
+            sampled.extend(rng.sample(remaining, min(n_want - len(sampled), len(remaining))))
+        elif len(sampled) > n_want:
+            sampled = rng.sample(sampled, n_want)
+        return sampled
+
+    if len(speak) >= n_speak_target and len(silent) >= n_silent_target:
+        sampled_speak = _stratified_sample(speak, n_speak_target)
+        sampled_silent = _stratified_sample(silent, n_silent_target)
+    elif len(speak) < n_speak_target:
+        sampled_speak = list(speak)
+        sampled_silent = _stratified_sample(silent, min(len(silent), target_total - len(sampled_speak)))
+    else:
+        sampled_silent = list(silent)
+        sampled_speak = _stratified_sample(speak, min(len(speak), target_total - len(sampled_silent)))
+    result = sampled_speak + sampled_silent
+    rng.shuffle(result)
+    return result[:target_total]
+
 
 class BalancedBatchSampler(Sampler):
-    """
-    Yields batches with a configurable SPEAK/SILENT ratio so each batch has
-    representation from both decisions. silent_ratio_in_batch=0.5 is 50/50;
-    use >0.5 to oversample SILENT and counter SPEAK bias.
-    """
     def __init__(
         self,
         speak_indices: List[int],
@@ -303,11 +458,6 @@ class BalancedBatchSampler(Sampler):
 
 
 class DistributedBalancedBatchSampler(Sampler):
-    """
-    Distributed version of BalancedBatchSampler: each rank gets a partition of
-    SPEAK/SILENT indices and builds batches with the given silent_ratio from
-    that partition so no sample is seen by two ranks.
-    """
     def __init__(
         self,
         speak_indices: List[int],
@@ -326,7 +476,6 @@ class DistributedBalancedBatchSampler(Sampler):
         n_speak = batch_size - n_silent
         self.n_speak = n_speak
         self.n_silent = n_silent
-        # Partition indices across ranks: this rank gets indices at position rank, rank+world_size, ...
         self.my_speak = [speak_indices[i] for i in range(rank, len(speak_indices), world_size)]
         self.my_silent = [silent_indices[i] for i in range(rank, len(silent_indices), world_size)]
         self.n_batches = min(len(self.my_speak) // n_speak, len(self.my_silent) // n_silent)
@@ -359,18 +508,45 @@ def prepare_datasets(
     train_fraction: float = 1.0,
     val_fraction: float = 1.0,
     debug_sample_io_path: str = None,
+    training_mode: str = TRAINING_MODE_DECISION_ONLY,
+    equal_sampling: bool = False,
+    filter_no_context: bool = True,
 ):
     if DATASET == "all":
         print("Loading training data from all datasets (ami, friends, spgi)...")
-        train_samples = []
+        train_parts: Dict[str, List[Dict]] = {}
         for name in ALL_DATASETS:
-            path = BASE_DIR / "data" / name / "train" / "train_samples.jsonl"
+            if training_mode == TRAINING_MODE_COT:
+                path = BASE_DIR / "data" / name / "train" / "train_samples_with_reasoning.jsonl"
+                if not path.exists():
+                    path = BASE_DIR / "data" / name / "train" / "train_samples.jsonl"
+                    if path.exists() and (rank is None or rank == 0):
+                        print(f"  {name}: train_samples_with_reasoning.jsonl not found; using train_samples.jsonl (reasoning will be placeholder)")
+            else:
+                path = BASE_DIR / "data" / name / "train" / "train_samples.jsonl"
             if path.exists():
                 part = load_samples(path)
-                train_samples.extend(part)
+                if training_mode == TRAINING_MODE_COT:
+                    for s in part:
+                        if "reasoning" not in s:
+                            s["reasoning"] = "No reasoning provided."
+                        if s.get("confidence") not in ("high", "medium", "low"):
+                            s["confidence"] = s.get("confidence") or "medium"
+                train_parts[name] = part
                 print(f"  {name}: {len(part):,} samples")
             else:
                 print(f"  {name}: (file not found, skipping)")
+                train_parts[name] = []
+        if equal_sampling and len(train_parts.get("spgi", [])) > EQUAL_SAMPLING_SPGI_TARGET:
+            spgi_train = _stratified_subsample_spgi(
+                train_parts["spgi"], target_total=EQUAL_SAMPLING_SPGI_TARGET, seed=EQUAL_SAMPLING_SEED
+            )
+            train_parts["spgi"] = spgi_train
+            if rank is None or rank == 0:
+                print(f"  Equal sampling: SPGI train subsampled to {len(spgi_train):,} (stratified 50/50 SPEAK/SILENT, category-proportional)")
+        train_samples = []
+        for name in ALL_DATASETS:
+            train_samples.extend(train_parts.get(name, []))
         print(f"  Total training samples: {len(train_samples):,}")
 
         print("Loading validation data from all datasets...")
@@ -379,6 +555,12 @@ def prepare_datasets(
             path = BASE_DIR / "data" / name / "val" / "val_samples.jsonl"
             if path.exists():
                 part = load_samples(path)
+                if training_mode == TRAINING_MODE_COT:
+                    for s in part:
+                        if "reasoning" not in s:
+                            s["reasoning"] = "No reasoning provided."
+                        if s.get("confidence") not in ("high", "medium", "low"):
+                            s["confidence"] = s.get("confidence") or "medium"
                 val_samples.extend(part)
                 print(f"  {name}: {len(part):,} samples")
             else:
@@ -386,11 +568,41 @@ def prepare_datasets(
         print(f"  Total validation samples: {len(val_samples):,}")
     else:
         print("Loading training data...")
-        train_samples = load_samples(TRAIN_FILE)
+        if training_mode == TRAINING_MODE_COT:
+            cot_train = BASE_DIR / "data" / DATASET / "train" / "train_samples_with_reasoning.jsonl"
+            train_path = cot_train if cot_train.exists() else TRAIN_FILE
+            if train_path == TRAIN_FILE and cot_train != TRAIN_FILE and (rank is None or rank == 0):
+                print(f"  train_samples_with_reasoning.jsonl not found; using train_samples.jsonl (reasoning will be placeholder)")
+            train_samples = load_samples(train_path)
+            if training_mode == TRAINING_MODE_COT:
+                for s in train_samples:
+                    if "reasoning" not in s:
+                        s["reasoning"] = "No reasoning provided."
+                    if s.get("confidence") not in ("high", "medium", "low"):
+                        s["confidence"] = s.get("confidence") or "medium"
+        else:
+            train_samples = load_samples(TRAIN_FILE)
         print(f"  Loaded {len(train_samples):,} training samples")
         print("Loading validation data...")
-        val_samples = load_samples(VAL_FILE)
+        if training_mode == TRAINING_MODE_COT:
+            cot_val = BASE_DIR / "data" / DATASET / "val" / "val_samples_with_reasoning.jsonl"
+            val_path = cot_val if cot_val.exists() else VAL_FILE
+            val_samples = load_samples(val_path)
+            for s in val_samples:
+                if "reasoning" not in s:
+                    s["reasoning"] = "No reasoning provided."
+                if s.get("confidence") not in ("high", "medium", "low"):
+                    s["confidence"] = s.get("confidence") or "medium"
+        else:
+            val_samples = load_samples(VAL_FILE)
         print(f"  Loaded {len(val_samples):,} validation samples")
+
+    if filter_no_context:
+        n_train_before, n_val_before = len(train_samples), len(val_samples)
+        train_samples = filter_samples_with_context(train_samples)
+        val_samples = filter_samples_with_context(val_samples)
+        if rank is None or rank == 0:
+            print(f"  Filtered to samples with context_turns: train {len(train_samples):,} (removed {n_train_before - len(train_samples):,}), val {len(val_samples):,} (removed {n_val_before - len(val_samples):,})")
 
     # Optionally use a subset for faster pipeline debugging (reproducible with seed 42)
     if train_fraction < 1.0 and len(train_samples) > 0:
@@ -407,16 +619,16 @@ def prepare_datasets(
             print(f"  Using subset: {len(val_samples):,} val samples ({val_fraction:.0%})")
 
     print("Creating datasets...")
-    train_dataset = TurnTakingDataset(train_samples, tokenizer, max_length, debug=debug)
-    val_dataset = TurnTakingDataset(val_samples, tokenizer, max_length, debug=debug)
+    print(f"  Training mode: {training_mode}")
+    train_dataset = TurnTakingDataset(train_samples, tokenizer, max_length, debug=debug, training_mode=training_mode)
+    val_dataset = TurnTakingDataset(val_samples, tokenizer, max_length, debug=debug, training_mode=training_mode)
     print(f"  Train dataset: {len(train_dataset):,} samples")
     print(f"  Val dataset: {len(val_dataset):,} samples")
 
-    # Write full model input and target for a few train/val samples to a file (only on rank 0)
     if debug and (rank is None or rank == 0) and debug_sample_io_path is not None:
         _write_sample_inputs_outputs(
             tokenizer, train_dataset, val_dataset, train_samples, val_samples,
-            max_length, Path(debug_sample_io_path), n_per_split=4,
+            max_length, Path(debug_sample_io_path), n_per_split=4, training_mode=training_mode,
         )
 
     batch_sampler = None
@@ -451,9 +663,6 @@ def prepare_datasets(
 
 
 def make_data_collator(tokenizer, max_length_cap: int = 8192):
-    """Returns a collator that stacks or pads batches and preserves our decision-token-only labels.
-    Use max_length_cap when using full examples (no truncation) to avoid OOM on very long batches."""
-
     def data_collator(features: List[Dict]):
         import torch
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -467,7 +676,6 @@ def make_data_collator(tokenizer, max_length_cap: int = 8192):
             }
             return batch
 
-        # Variable length: pad to longest in batch, cap to avoid OOM
         max_len = min(max(lengths), max_length_cap)
         padded_input_ids = []
         padded_attention_mask = []

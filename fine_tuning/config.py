@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-LoRA fine-tuning config. MODEL and DATASET are read from the environment at import time.
-If MODEL is set, it must be one of MODEL_OPTIONS keys; otherwise ImportError/ValueError can occur
-when any code imports this module (e.g. run_benchmark, train_lora, evaluate_finetuned).
-"""
+"""LoRA fine-tuning config. MODEL and DATASET read from environment at import time."""
 
 import os
 from pathlib import Path
@@ -28,9 +24,9 @@ BASE_MODEL = MODEL_OPTIONS[MODEL]
 DATASET = os.environ.get("DATASET", "ami")
 
 LORA_CONFIG = {
-    "r": 8,
-    "lora_alpha": 16,
-    "lora_dropout": 0.15,
+    "r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.05,
     "target_modules": [
         "q_proj",
         "k_proj", 
@@ -47,28 +43,28 @@ LORA_CONFIG = {
 TRAINING_CONFIG = {
     "output_dir": "checkpoints",
     "num_train_epochs": 1,
-    "per_device_train_batch_size": 4,
-    "per_device_eval_batch_size": 2,
-    "gradient_accumulation_steps": 10,
+    "per_device_train_batch_size": 16,
+    "per_device_eval_batch_size": 8,
+    "gradient_accumulation_steps": 2,
     "learning_rate": 2e-4,
     "lr_scheduler_type": "cosine",
     "warmup_steps": 100,
-    "logging_steps": 100,
+    "logging_steps": 50,
     "save_steps": 100,
-    "eval_steps": 10,
+    "eval_steps": 100,
     "save_total_limit": 10,
-    "eval_strategy": "steps",  # enable validation for early stopping and best-checkpoint selection
+    "eval_strategy": "steps",
     "save_strategy": "steps",
     "load_best_model_at_end": True,
     "metric_for_best_model": "eval_macro_f1",
     "greater_is_better": True,
     "fp16": False,
     "bf16": True,
-    "gradient_checkpointing": True,
+    "gradient_checkpointing": False,
     "optim": "adamw_torch_fused",
     "report_to": "none",
     "seed": 42,
-    "dataloader_num_workers": 4,
+    "dataloader_num_workers": 8,
     "dataloader_pin_memory": True,
     "remove_unused_columns": False,
     "ddp_find_unused_parameters": False,

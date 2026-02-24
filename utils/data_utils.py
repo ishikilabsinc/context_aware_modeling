@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
-"""
-Data Utilities
-
-Shared functions for loading and processing data files.
-"""
+"""Shared data loading and filtering utilities."""
 
 import json
 from pathlib import Path
 from typing import List, Dict
 
 
+def has_context_turns(sample: Dict) -> bool:
+    ctx = sample.get("context_turns", [])
+    return bool(ctx)
+
+
+def filter_samples_with_context(samples: List[Dict]) -> List[Dict]:
+    return [s for s in samples if has_context_turns(s)]
+
+
 def load_samples(file_path: Path) -> List[Dict]:
-    """
-    Load samples from JSONL file
-    
-    Args:
-        file_path: Path to JSONL file
-        
-    Returns:
-        List of sample dictionaries
-    """
     samples = []
     
     try:

@@ -17,7 +17,7 @@ from collections import defaultdict
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from utils.data_utils import load_samples
+from utils.data_utils import load_samples, filter_samples_with_context
 from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL, BASE_MODEL as DEFAULT_BASE_MODEL
 from benchmarking.metrics import compute_metrics, generate_detail_report
 
@@ -348,6 +348,14 @@ def extract_decision_from_output(text: str) -> Optional[str]:
         if match:
             decision = match.group(1).strip().upper()
         else:
+            # Output may end with <decision>SPEAK or <decision>SILENT without </decision> (e.g. vLLM excluded stop string)
+            partial = re.search(r'<decision>\s*(\S+)', text, re.IGNORECASE)
+            if partial:
+                raw = partial.group(1).strip().upper()
+                if raw.startswith('SPEAK'):
+                    return 'SPEAK'
+                if raw.startswith('SILE'):
+                    return 'SILENT'
             underscore_match = re.search(r'_([A-Z]+)_', text, re.IGNORECASE)
             if underscore_match:
                 decision = underscore_match.group(1).strip().upper()
@@ -678,6 +686,7 @@ def main(
     debug_prompts: bool = False,
     model: Optional[str] = None,
     system_prompt_repeat: Optional[int] = None,
+    filter_no_context: bool = True,
 ):
     global SYSTEM_PROMPT_REPEAT
     if system_prompt_repeat is not None:
@@ -716,6 +725,14 @@ def main(
     print(f"\nLoading samples from {EVAL_FILE}...")
     samples = load_samples(EVAL_FILE)
     print(f"Loaded {len(samples)} samples")
+    if filter_no_context:
+        n_before = len(samples)
+        samples = filter_samples_with_context(samples)
+        n_removed = n_before - len(samples)
+        print(f"Filtered to samples with context_turns: {len(samples)} (removed {n_removed} with no context)")
+    if not samples:
+        print("No samples left after filtering. Exiting.")
+        return None
 
     all_predictions = evaluate_samples(
         samples, model, tokenizer, use_vllm, BATCH_SIZE,
@@ -781,10 +798,15 @@ if __name__ == '__main__':
                         help='Print full system prompt, instruction, and input for first 3-4 samples')
     parser.add_argument('--system-prompt-repeat', type=int, default=None, choices=[1, 2],
                         help='Repeat system prompt 1 or 2 times (default: use module default)')
+    parser.add_argument('--filter-no-context', action='store_true', default=True,
+                        help='Exclude samples with no context_turns from evaluation (default: True)')
+    parser.add_argument('--no-filter-no-context', action='store_false', dest='filter_no_context',
+                        help='Do not filter; include samples with no context_turns')
     args = parser.parse_args()
     main(
         dataset=args.dataset,
         debug_prompts=args.debug_prompts,
         model=args.model,
         system_prompt_repeat=args.system_prompt_repeat,
+        filter_no_context=args.filter_no_context,
     )

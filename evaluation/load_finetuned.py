@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-Load fine-tuned LoRA model for evaluation. Uses config for base model and adapter path.
-Supports loading a specific checkpoint (e.g. checkpoint-2000) via adapter_path.
-"""
+"""Load fine-tuned LoRA model for evaluation."""
 
 import sys
 from pathlib import Path
@@ -45,7 +42,6 @@ def load_finetuned_model_vllm(
         )
 
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    # vLLM needs max_lora_rank >= training rank (e.g. 32 for r32)
     max_lora_rank = max(64, (lora_rank or 0) * 2) if lora_rank else 64
 
     print("\nLoading model with vLLM (native LoRA support)...")
@@ -53,16 +49,15 @@ def load_finetuned_model_vllm(
         model=BASE_MODEL,
         dtype="bfloat16",
         tensor_parallel_size=1,
-        max_model_len=16384,  # Match the training config
-        gpu_memory_utilization=0.75,  # Reduced from 0.85 to save memory
-        max_num_seqs=64,  # Reduced from 128 to avoid OOM during warmup
+        max_model_len=16384,
+        gpu_memory_utilization=0.75,
+        max_num_seqs=64,
         trust_remote_code=True,
-        enable_lora=True,  # Enable LoRA support
+        enable_lora=True,
         max_lora_rank=max_lora_rank,
-        max_loras=1,  # Number of LoRA adapters
+        max_loras=1,
     )
 
-    # vLLM loads LoRA per request via LoRARequest(lora_name, lora_int_id, lora_path), not add_lora()
     adapter_name = "finetuned_lora"
     llm._lora_adapter_name = adapter_name
     llm._lora_adapter_path = str(adapter_dir)
@@ -90,11 +85,6 @@ def load_finetuned_model(
     adapter_path: Optional[Path] = None,
     lora_rank: Optional[int] = None,
 ):
-    """
-    Load fine-tuned LoRA model. adapter_path overrides the default (FINAL_MODEL_DIR),
-    e.g. to evaluate a specific checkpoint: adapter_path=Path(".../checkpoint-2000").
-    lora_rank: used for vLLM max_lora_rank (e.g. 32 for r32 runs).
-    """
     print("="*70)
     print("LOADING FINE-TUNED MODEL")
     print("="*70)

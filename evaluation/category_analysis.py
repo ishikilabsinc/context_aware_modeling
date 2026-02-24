@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-Per-category performance analysis of fine-tuned evaluation results.
-"""
+"""Per-category performance analysis of fine-tuned evaluation results."""
 
 import argparse
 import json
@@ -25,8 +23,6 @@ def load_results(file_path: Path) -> Dict:
 def analyze_category_performance(results: Dict) -> Dict:
     predictions = results.get('predictions', [])
     category_analysis = {}
-
-    # Use categories that actually appear in the data (data-driven, supports 4- or 8-category schemes)
     categories = sorted(set(p.get('category') for p in predictions if p.get('category')))
 
     for cat in categories:
@@ -150,6 +146,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Category analysis of fine-tuned results")
     parser.add_argument("--dataset", type=str, default="ami", choices=["ami", "friends", "spgi"])
     parser.add_argument("--model", type=str, default=None, help="Model key (default: from MODEL env)")
-    parser.add_argument("--suffix", type=str, default="", help="Filename suffix for run (e.g. _r32, _checkpoint-2000); must match evaluate_finetuned.py output")
+    parser.add_argument("--lora-rank", type=int, default=None, metavar="N", help="Use results from run with --lora-rank N (suffix _rN)")
+    parser.add_argument("--suffix", type=str, default="", help="Filename suffix (e.g. _checkpoint-2000). Overridden by --lora-rank.")
     args = parser.parse_args()
-    main(dataset=args.dataset, model=args.model, suffix=args.suffix)
+    suffix = args.suffix
+    if args.lora_rank is not None:
+        suffix = f"_r{args.lora_rank}"
+    main(dataset=args.dataset, model=args.model, suffix=suffix)
