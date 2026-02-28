@@ -25,6 +25,7 @@ EVALUATE_SCRIPT = BENCHMARK_DIR / "evaluate_baseline.py"
 
 sys.path.insert(0, str(REPO_ROOT))
 from fine_tuning.config import MODEL_OPTIONS
+from benchmarking.evaluate_baseline import BENCHMARK_MODEL_OPTIONS, API_MODEL_OPTIONS
 from benchmarking.metrics import compute_metrics, generate_detail_report
 
 DATASETS = ["ami", "friends", "spgi"]
@@ -65,6 +66,7 @@ def run_one(
     repeat: int,
     gpu_id: Optional[int] = None,
     filter_no_context: bool = True,
+    api_concurrency: int = 32,
 ) -> Tuple[Tuple[str, str, int], bool]:
     env = os.environ.copy()
     if gpu_id is not None:
@@ -75,6 +77,7 @@ def run_one(
         "--dataset", dataset,
         "--model", model_key,
         "--system-prompt-repeat", str(repeat),
+        "--api-concurrency", str(api_concurrency),
     ]
     if filter_no_context:
         cmd.append("--filter-no-context")
@@ -276,9 +279,10 @@ def main(
     repeats: Optional[List[int]] = None,
     max_parallel: Optional[int] = None,
     filter_no_context: bool = True,
+    api_concurrency: int = 32,
 ) -> None:
     datasets = datasets or get_datasets_with_test()
-    models = models or list(MODEL_OPTIONS.keys())
+    models = models or list(BENCHMARK_MODEL_OPTIONS.keys())
     repeats = repeats or [1, 2]
 
     if not datasets:
@@ -297,10 +301,16 @@ def main(
         ]
         total = len(jobs)
         num_gpus = get_num_gpus()
+        api_only = all(m in API_MODEL_OPTIONS for m in models)
         if max_parallel is None:
-            max_parallel = min(4, num_gpus) if num_gpus > 0 else 1
+            if num_gpus > 0:
+                max_parallel = min(4, num_gpus)
+            elif api_only:
+                max_parallel = 4  # API runs use RAM only; no GPU needed
+            else:
+                max_parallel = 1
         max_parallel = max(1, max_parallel)
-        if num_gpus > 0 and max_parallel > num_gpus:
+        if num_gpus > 0 and max_parallel > num_gpus and not api_only:
             max_parallel = num_gpus
 
         print("=" * 70)
@@ -310,9 +320,14 @@ def main(
         print(f"Models: {models}")
         print(f"System prompt repeats: {repeats}")
         print(f"Filter no-context samples: {filter_no_context}")
+        if api_only:
+            print(f"API concurrency per job: {api_concurrency}")
         print(f"Total jobs: {total}")
-        if max_parallel > 1 and num_gpus > 0:
-            print(f"Parallel: {max_parallel} workers (1 GPU each, {num_gpus} GPUs available)")
+        if max_parallel > 1:
+            if api_only:
+                print(f"Parallel: {max_parallel} workers (API-only; no GPU, moderate RAM per worker)")
+            else:
+                print(f"Parallel: {max_parallel} workers (1 GPU each, {num_gpus} GPUs available)")
         else:
             print("Parallel: 1 (sequential)")
 
@@ -320,7 +335,10 @@ def main(
         if max_parallel <= 1:
             for i, (dataset, model_key, repeat) in enumerate(jobs, 1):
                 print(f"\n[{i}/{total}] {dataset} / {model_key} / SP repeat {repeat}")
-                _, ok = run_one(dataset, model_key, repeat, gpu_id=None, filter_no_context=filter_no_context)
+                _, ok = run_one(
+                    dataset, model_key, repeat, gpu_id=None,
+                    filter_no_context=filter_no_context, api_concurrency=api_concurrency,
+                )
                 if not ok:
                     failed.append((dataset, model_key, repeat))
         else:
@@ -333,6 +351,7 @@ def main(
                         repeat,
                         i % max_parallel,
                         filter_no_context,
+                        api_concurrency,
                     ): (dataset, model_key, repeat)
                     for i, (dataset, model_key, repeat) in enumerate(jobs)
                 }
@@ -421,8 +440,8 @@ if __name__ == "__main__":
         "--models",
         nargs="+",
         default=None,
-        choices=list(MODEL_OPTIONS.keys()),
-        help="Model keys to run (default: all).",
+        choices=list(BENCHMARK_MODEL_OPTIONS.keys()),
+        help="Model keys to run (default: all, including API models gpt-5.2, gemini-3.1-pro).",
     )
     parser.add_argument(
         "--system-prompt-repeats",
@@ -438,7 +457,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         metavar="N",
-        help="Max evaluations in parallel, 1 GPU each (default: min(4, num_gpus)). Set 1 to force sequential.",
+        help="Max evaluations in parallel. GPU runs: 1 GPU per worker (default: min(4, num_gpus)). API-only runs: default 4 workers, no GPU (more RAM). Use 2 for less RAM. Set 1 for sequential.",
     )
     parser.add_argument(
         "--filter-no-context",
@@ -452,6 +471,13 @@ if __name__ == "__main__":
         dest="filter_no_context",
         help="Do not filter; include samples with no context_turns.",
     )
+    parser.add_argument(
+        "--api-concurrency",
+        type=int,
+        default=32,
+        metavar="N",
+        help="Max concurrent API requests per job when using OpenAI/Gemini (default: 32).",
+    )
     args = parser.parse_args()
     main(
         skip_run=args.skip_run,
@@ -460,4 +486,5 @@ if __name__ == "__main__":
         repeats=args.repeats,
         max_parallel=args.max_parallel,
         filter_no_context=args.filter_no_context,
+        api_concurrency=args.api_concurrency,
     )

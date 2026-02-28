@@ -42,16 +42,16 @@ LORA_CONFIG = {
 
 TRAINING_CONFIG = {
     "output_dir": "checkpoints",
-    "num_train_epochs": 1,
+    "num_train_epochs": 3,
     "per_device_train_batch_size": 16,
     "per_device_eval_batch_size": 8,
     "gradient_accumulation_steps": 2,
-    "learning_rate": 2e-4,
+    "learning_rate": 1e-4,
     "lr_scheduler_type": "cosine",
-    "warmup_steps": 100,
+    "warmup_steps": 10,
     "logging_steps": 50,
-    "save_steps": 100,
-    "eval_steps": 100,
+    "save_steps": 20,
+    "eval_steps": 20,
     "save_total_limit": 10,
     "eval_strategy": "steps",
     "save_strategy": "steps",
@@ -69,6 +69,7 @@ TRAINING_CONFIG = {
     "remove_unused_columns": False,
     "ddp_find_unused_parameters": False,
     "silent_ratio_in_batch": 0.5,
+    "four_way_balanced": True,
 }
 
 

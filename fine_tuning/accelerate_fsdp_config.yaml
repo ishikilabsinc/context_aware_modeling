@@ -2,6 +2,7 @@
 # Use with: accelerate launch --config_file fine_tuning/accelerate_fsdp_config.yaml fine_tuning/train_lora.py --fsdp --dataset all
 # Adjust num_processes to your number of GPUs. If needed, add fsdp_transformer_layer_cls_to_wrap for your model (e.g. Qwen2DecoderLayer).
 # For faster startup with small models (e.g. 4B) that fit on one GPU, use accelerate_ddp_config.yaml and run without --fsdp.
+# FULL_STATE_DICT ensures every checkpoint is saved in loadable form for evaluation (e.g. --checkpoint checkpoint-100).
 
 compute_environment: LOCAL_MACHINE
 debug: false
@@ -15,7 +16,8 @@ fsdp_config:
   fsdp_forward_prefetch: false
   fsdp_offload_params: false
   fsdp_sharding_strategy: FULL_SHARD
-  fsdp_state_dict_type: SHARDED_STATE_DICT
+  # FULL_STATE_DICT so mid checkpoints (e.g. checkpoint-100) are loadable for evaluation
+  fsdp_state_dict_type: FULL_STATE_DICT
   fsdp_sync_module_states: true
   fsdp_use_orig_params: true
 machine_rank: 0

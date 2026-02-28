@@ -28,6 +28,61 @@ except ImportError:
 from peft import LoraConfig, get_peft_model, TaskType
 import torch
 
+# Expected decision for 4-way categories (for sampler sanity check)
+_CATEGORY_TO_EXPECTED_DECISION = {
+    "SPEAK_explicit": "SPEAK",
+    "SPEAK_implicit": "SPEAK",
+    "SILENT_ref": "SILENT",
+    "SILENT_no_ref": "SILENT",
+}
+
+
+def _run_sampler_sanity_check(train_batch_sampler, train_samples, output_path: Path, rank=None):
+    """Check that indices from the batch sampler point to samples with matching category/decision. Write results to output_path."""
+    if train_batch_sampler is None or train_samples is None:
+        return
+    try:
+        first_batch = next(iter(train_batch_sampler))
+    except Exception as e:
+        with open(output_path, "w") as f:
+            f.write(f"Failed to get first batch from sampler: {e}\n")
+        return
+    n_show = min(10, len(first_batch))
+    lines = [
+        "Sampler sanity check: first batch indices vs actual sample category and decision.",
+        "If 'OK' is False, the sampler index does not match the sample (label mismatch bug).",
+        "",
+        f"Batch size: {len(first_batch)}  Showing first {n_show}.",
+        "",
+        "index | category        | decision | expected (from category) | OK",
+        "-" * 70,
+    ]
+    n_ok = 0
+    for i in range(n_show):
+        idx = first_batch[i]
+        if idx < 0 or idx >= len(train_samples):
+            lines.append(f"  {idx}  | OUT OF RANGE (len={len(train_samples)}) | FAIL")
+            continue
+        s = train_samples[idx]
+        category = s.get("category") or "(missing)"
+        decision = s.get("decision") or "(missing)"
+        expected = _CATEGORY_TO_EXPECTED_DECISION.get(category)
+        if expected is None:
+            ok = decision in ("SPEAK", "SILENT")  # can't verify category
+            status = "OK (category not in 4-way)" if ok else "FAIL (bad decision)"
+        else:
+            ok = decision == expected
+            status = "OK" if ok else "FAIL"
+        if ok:
+            n_ok += 1
+        lines.append(f"  {idx:<5} | {str(category):<15} | {str(decision):<8} | {str(expected):<24} | {status}")
+    lines.extend(["", f"Summary: {n_ok}/{n_show} passed.", ""])
+    out_text = "\n".join(lines)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write(out_text)
+    print(f"  Sampler sanity check written to {output_path} ({n_ok}/{n_show} passed)")
+
 
 def setup_model_and_tokenizer(lora_rank=None, use_fsdp=False, local_rank=-1):
     from config import LORA_CONFIG, BASE_MODEL
@@ -128,12 +183,13 @@ def setup_model_and_tokenizer(lora_rank=None, use_fsdp=False, local_rank=-1):
 
 
 
-def _make_compute_metrics(tokenizer):
+def _make_compute_metrics(tokenizer, eval_predictions_path=None):
     import numpy as np
     speak_ids = tokenizer.encode("SPEAK", add_special_tokens=False)
     silent_ids = tokenizer.encode("SILENT", add_special_tokens=False)
     speak_id = int(speak_ids[1]) if len(speak_ids) >= 2 else (int(speak_ids[-1]) if speak_ids else -1)
     silent_id = int(silent_ids[1]) if len(silent_ids) >= 2 else (int(silent_ids[-1]) if silent_ids else -1)
+    _eval_run_counter = [0]  # mutable so we can increment in closure
 
     def compute_metrics(eval_pred):
         if hasattr(eval_pred, "predictions"):
@@ -185,6 +241,28 @@ def _make_compute_metrics(tokenizer):
             return {"accuracy": 0.0, "macro_f1": 0.0, "balanced_accuracy": 0.0}
         y_true = np.asarray(y_true)
         y_pred = np.asarray(y_pred)
+
+        # Save predictions to file (rank 0 only) for inspection
+        if eval_predictions_path and os.environ.get("LOCAL_RANK", "0") == "0":
+            try:
+                _eval_run_counter[0] += 1
+                run_num = _eval_run_counter[0]
+                path = Path(eval_predictions_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a") as f:
+                    f.write(f"\n=== Eval run {run_num} (n={len(y_true)} samples) ===\n")
+                    f.write("idx   true   pred   true_label  pred_label  correct\n")
+                    for i in range(len(y_true)):
+                        t, p = int(y_true[i]), int(y_pred[i])
+                        tl = "SPEAK" if t == 1 else "SILENT"
+                        pl = "SPEAK" if p == 1 else "SILENT"
+                        ok = "yes" if t == p else "no"
+                        f.write(f"{i:<5} {t}      {p}      {tl:<11} {pl:<11} {ok}\n")
+                    f.write("\n")
+            except Exception as e:
+                import traceback
+                print(f"  [eval_predictions] Failed to write {eval_predictions_path}: {e}\n{traceback.format_exc()}")
+
         # Safeguard: if only one class in gathered eval set, metrics are misleading (val set balance or label bug)
         n_classes = len(np.unique(y_true))
         if n_classes == 1 and os.environ.get("LOCAL_RANK", "0") == "0":
@@ -477,12 +555,13 @@ def main(
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         if world_size > 1:
             rank = int(os.environ.get("RANK", 0))
-    train_dataset, val_dataset, train_batch_sampler = prepare_datasets(
+    train_dataset, val_dataset, train_batch_sampler, train_samples = prepare_datasets(
         tokenizer,
         max_length=max_length,
         debug=debug,
         batch_size=batch_size,
         use_balanced_batches=True,
+        four_way_balanced=TRAINING_CONFIG.get("four_way_balanced", True),
         rank=rank,
         world_size=world_size,
         silent_ratio_in_batch=TRAINING_CONFIG.get("silent_ratio_in_batch", 0.5),
@@ -498,7 +577,7 @@ def main(
     print("SETTING UP TRAINING")
     print("="*70)
 
-    training_config = {k: v for k, v in TRAINING_CONFIG.items() if k not in ("output_dir", "silent_ratio_in_batch")}
+    training_config = {k: v for k, v in TRAINING_CONFIG.items() if k not in ("output_dir", "silent_ratio_in_batch", "four_way_balanced")}
     if use_fsdp:
         training_config["fsdp"] = ["full_shard"]
         training_config["gradient_checkpointing"] = False
@@ -542,7 +621,10 @@ def main(
         collator_cap = getattr(tokenizer, "model_max_length", 8192)
     data_collator_obj = make_data_collator(tokenizer, max_length_cap=collator_cap)
 
-    compute_metrics_fn = _make_compute_metrics(tokenizer)
+    compute_metrics_fn = _make_compute_metrics(
+        tokenizer,
+        eval_predictions_path=run_output_dir / "eval_predictions.txt",
+    )
     callbacks = [EvalSummaryCallback(), LogTargetVsPredictedCallback(n_samples=4)]
     if (
         training_config.get("eval_strategy") != "no"
@@ -565,6 +647,15 @@ def main(
     if hasattr(trainer.model, "gradient_checkpointing_disable"):
         trainer.model.gradient_checkpointing_disable()
 
+    # Sanity check: verify sampler indices match sample category/decision (saved to file for inspection)
+    if rank is None or rank == 0:
+        _run_sampler_sanity_check(
+            train_batch_sampler,
+            train_samples,
+            run_output_dir / "sampler_sanity_check.txt",
+            rank=rank,
+        )
+
     print("\n" + "="*70)
     print("STARTING TRAINING")
     print("="*70)
@@ -586,7 +677,8 @@ def main(
     print("="*70)
 
     run_final_model_dir.mkdir(parents=True, exist_ok=True)
-    # With FSDP, Trainer only saves properly after gathering full state (so PEFT adapter is saved)
+    # With FSDP, ensure full state dict so final save is loadable. Mid checkpoints are full only if
+    # accelerate_fsdp_config.yaml uses fsdp_state_dict_type: FULL_STATE_DICT (recommended for eval).
     if getattr(trainer, "is_fsdp_enabled", False) and getattr(
         trainer.accelerator.state, "fsdp_plugin", None
     ):
@@ -660,7 +752,7 @@ if __name__ == "__main__":
         type=str,
         default="decision_only",
         choices=["decision_only", "cot"],
-        help="Training mode: decision_only (response = <decision>SPEAK|SILENT</decision> only) or cot (chain-of-thought; not yet implemented). Checkpoints are saved to mode-specific dirs (e.g. ..._cot) so modes do not overwrite each other.",
+        help="Training mode: decision_only (response = <decision>SPEAK|SILENT</decision> only) or cot (chain-of-thought: <reasoning> + <decision> + <confidence>; uses train_samples_with_reasoning.jsonl). Checkpoints are saved to mode-specific dirs (e.g. ..._cot) so modes do not overwrite each other.",
     )
     parser.add_argument(
         "--equal-sampling",

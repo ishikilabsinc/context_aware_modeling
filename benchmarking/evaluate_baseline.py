@@ -11,6 +11,7 @@ import time
 import sys
 import os
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
@@ -20,6 +21,188 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.data_utils import load_samples, filter_samples_with_context
 from fine_tuning.config import MODEL_OPTIONS, MODEL as DEFAULT_MODEL, BASE_MODEL as DEFAULT_BASE_MODEL
 from benchmarking.metrics import compute_metrics, generate_detail_report
+
+# API-based closed-source models (same task, same input/output as open-source baselines)
+API_MODEL_OPTIONS = {
+    "gpt-5.2": "openai/gpt-5.2",
+    "gemini-3.1-pro": "google/gemini-3.1-pro-preview",
+}
+BENCHMARK_MODEL_OPTIONS = {**MODEL_OPTIONS, **API_MODEL_OPTIONS}
+
+
+def is_api_model(model_id: str) -> bool:
+    """True if model_id denotes an API model (OpenAI or Google)."""
+    return isinstance(model_id, str) and (
+        model_id.startswith("openai/") or model_id.startswith("google/")
+    )
+
+
+def _call_openai(model_name: str, system_content: str, user_content: str) -> Tuple[str, float]:
+    """Call OpenAI Chat API; return (response_text, latency_seconds). Retries on 503/429 with backoff."""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY environment variable is required for OpenAI models.")
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content},
+    ]
+    max_retries = 4
+    for attempt in range(max_retries):
+        start = time.perf_counter()
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=TEMPERATURE,
+                max_completion_tokens=MAX_NEW_TOKENS,
+            )
+            elapsed = time.perf_counter() - start
+            text = (resp.choices[0].message.content or "").strip()
+            return text, elapsed
+        except Exception as e:
+            status_code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+            if status_code is None and "RateLimitError" in type(e).__name__:
+                status_code = 429
+            if status_code in (429, 503) and attempt < max_retries - 1:
+                delay = 2 ** (attempt + 1)  # 2, 4, 8, 16 seconds
+                print(f"  API {status_code}, retrying in {delay}s (attempt {attempt + 1}/{max_retries})...", flush=True)
+                time.sleep(delay)
+            else:
+                raise
+
+
+def _call_gemini(model_name: str, system_content: str, user_content: str) -> Tuple[str, float]:
+    """Call Google Gemini API; return (response_text, latency_seconds). Retries on 503/429 with backoff."""
+    from google import genai
+    from google.genai import types
+    try:
+        from google.genai.errors import ServerError
+    except ImportError:
+        ServerError = None  # type: ignore
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is required for Gemini models.")
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(
+        system_instruction=system_content,
+        temperature=TEMPERATURE,
+        max_output_tokens=MAX_NEW_TOKENS,
+    )
+    max_retries = 4
+    for attempt in range(max_retries):
+        start = time.perf_counter()
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_content,
+                config=config,
+            )
+            elapsed = time.perf_counter() - start
+            text = (getattr(response, "text", None) or "").strip()
+            return text, elapsed
+        except Exception as e:
+            status_code = getattr(e, "status_code", None)
+            if status_code is None and ServerError is not None and isinstance(e, ServerError):
+                status_code = getattr(e, "status_code", None)
+            if status_code in (429, 503) and attempt < max_retries - 1:
+                delay = 2 ** (attempt + 1)  # 2, 4, 8, 16 seconds
+                print(f"  API {status_code}, retrying in {delay}s (attempt {attempt + 1}/{max_retries})...", flush=True)
+                time.sleep(delay)
+            else:
+                raise
+
+
+def _infer_api(
+    samples: List[Dict],
+    model_id: str,
+    api_concurrency: int = 32,
+) -> List[Tuple[str, float]]:
+    """Run API inference for all samples in parallel. Returns list of (output_text, latency) in sample order."""
+    if model_id.startswith("openai/"):
+        model_name = model_id.split("/", 1)[1]
+        caller = lambda s, u: _call_openai(model_name, s, u)
+    elif model_id.startswith("google/"):
+        model_name = model_id.split("/", 1)[1]
+        caller = lambda s, u: _call_gemini(model_name, s, u)
+    else:
+        raise ValueError(f"Unknown API model_id: {model_id}")
+
+    n = len(samples)
+    workers = min(api_concurrency, n)
+    index_to_result: Dict[int, Tuple[str, float]] = {}
+
+    def do_one(idx: int) -> Tuple[int, Tuple[str, float]]:
+        sample = samples[idx]
+        system_content, user_content = _build_system_and_user_content(sample)
+        text, lat = caller(system_content, user_content)
+        return (idx, (text, lat))
+
+    progress_interval = max(1, n // 20)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(do_one, i): i for i in range(n)}
+        for future in as_completed(futures):
+            idx, result = future.result()
+            index_to_result[idx] = result
+            completed += 1
+            if completed % progress_interval == 0 or completed == n:
+                print(f"  Processed {completed}/{n} samples...", flush=True)
+
+    return [index_to_result[i] for i in range(n)]
+
+
+def evaluate_samples_api(
+    samples: List[Dict],
+    model_id: str,
+    debug_prompts: bool = False,
+    api_concurrency: int = 32,
+) -> List[Dict]:
+    """Evaluate samples using OpenAI or Gemini API. Returns same prediction list shape as evaluate_samples."""
+    print(f"\nEvaluating {len(samples)} samples via API ({model_id}) (concurrency={api_concurrency})...")
+    batch_results = _infer_api(samples, model_id, api_concurrency=api_concurrency)
+    all_predictions = []
+    for (output_text, latency), sample in zip(batch_results, samples):
+        prediction = extract_decision_from_output(output_text)
+        ground_truth = sample.get('decision', 'UNKNOWN')
+        context_turns_list = sample.get('context_turns', [])
+        if len(context_turns_list) > MAX_CONTEXT_TURNS_IN_RESULTS:
+            context_turns_display = context_turns_list[-MAX_CONTEXT_TURNS_IN_RESULTS:]
+            context_turns_total = len(context_turns_list)
+        else:
+            context_turns_display = context_turns_list
+            context_turns_total = len(context_turns_list)
+        all_predictions.append({
+            'sample_id': sample.get('decision_point_id', ''),
+            'ground_truth': ground_truth,
+            'prediction': prediction,
+            'category': sample.get('category', 'UNKNOWN'),
+            'output_text': output_text,
+            'latency': latency,
+            'target_speaker': sample.get('target_speaker', 'N/A'),
+            'all_speakers': sample.get('all_speakers', []),
+            'context_turns': context_turns_display,
+            'context_turns_total': context_turns_total,
+            'current_turn': sample.get('current_turn', {}),
+            'confidence': sample.get('confidence', 'N/A'),
+        })
+    # Same summary stats as evaluate_samples
+    prediction_counts = defaultdict(int)
+    ground_truth_counts = defaultdict(int)
+    none_predictions = 0
+    for p in all_predictions:
+        pred = p['prediction']
+        gt = p['ground_truth']
+        prediction_counts[pred if pred else 'None'] += 1
+        ground_truth_counts[gt] += 1
+        if pred is None:
+            none_predictions += 1
+    print(f"  Total samples: {len(all_predictions)}")
+    print(f"  Predictions: SPEAK={prediction_counts.get('SPEAK', 0)}, SILENT={prediction_counts.get('SILENT', 0)}, None={none_predictions}")
+    print(f"  Ground truth: SPEAK={ground_truth_counts.get('SPEAK', 0)}, SILENT={ground_truth_counts.get('SILENT', 0)}")
+    return all_predictions
+
 
 # Model / inference configuration
 USE_VLLM = True
@@ -687,6 +870,7 @@ def main(
     model: Optional[str] = None,
     system_prompt_repeat: Optional[int] = None,
     filter_no_context: bool = True,
+    api_concurrency: int = 32,
 ):
     global SYSTEM_PROMPT_REPEAT
     if system_prompt_repeat is not None:
@@ -698,9 +882,9 @@ def main(
     EVAL_FILE = TEST_FILE
 
     model_key = model if model is not None else DEFAULT_MODEL
-    model_id = MODEL_OPTIONS.get(model_key) or DEFAULT_BASE_MODEL
-    if model_key not in MODEL_OPTIONS:
-        model_key = next((k for k, v in MODEL_OPTIONS.items() if v == model_id), model_key)
+    model_id = BENCHMARK_MODEL_OPTIONS.get(model_key) or MODEL_OPTIONS.get(model_key) or DEFAULT_BASE_MODEL
+    if model_key not in BENCHMARK_MODEL_OPTIONS:
+        model_key = next((k for k, v in BENCHMARK_MODEL_OPTIONS.items() if v == model_id), model_key)
 
     RESULTS_DIR = Path(__file__).parent / 'results'
     REPORTS_DIR = RESULTS_DIR / 'reports'
@@ -715,13 +899,6 @@ def main(
     print(f"Dataset: {dataset.upper()}")
     print("="*70)
 
-    print("\nLoading model...")
-    loader = InstructModelLoader(model_id=model_id, use_vllm=USE_VLLM)
-    model_result = loader.load()
-    model = model_result['model']
-    tokenizer = model_result['tokenizer']
-    use_vllm = model_result['use_vllm']
-
     print(f"\nLoading samples from {EVAL_FILE}...")
     samples = load_samples(EVAL_FILE)
     print(f"Loaded {len(samples)} samples")
@@ -734,10 +911,22 @@ def main(
         print("No samples left after filtering. Exiting.")
         return None
 
-    all_predictions = evaluate_samples(
-        samples, model, tokenizer, use_vllm, BATCH_SIZE,
-        debug_prompts=debug_prompts, model_id=model_id,
-    )
+    if is_api_model(model_id):
+        print("\nUsing API (no local model load).")
+        all_predictions = evaluate_samples_api(
+            samples, model_id, debug_prompts=debug_prompts, api_concurrency=api_concurrency
+        )
+    else:
+        print("\nLoading model...")
+        loader = InstructModelLoader(model_id=model_id, use_vllm=USE_VLLM)
+        model_result = loader.load()
+        model = model_result['model']
+        tokenizer = model_result['tokenizer']
+        use_vllm = model_result['use_vllm']
+        all_predictions = evaluate_samples(
+            samples, model, tokenizer, use_vllm, BATCH_SIZE,
+            debug_prompts=debug_prompts, model_id=model_id,
+        )
 
     payload = {
         "dataset": dataset,
@@ -792,8 +981,8 @@ if __name__ == '__main__':
                         choices=['ami', 'friends', 'spgi'],
                         help='Dataset name (default: ami)')
     parser.add_argument('--model', type=str, default=None,
-                        choices=list(MODEL_OPTIONS.keys()),
-                        help=f'Model key (default: from MODEL env or {DEFAULT_MODEL!r})')
+                        choices=list(BENCHMARK_MODEL_OPTIONS.keys()),
+                        help=f'Model key (default: from MODEL env or {DEFAULT_MODEL!r}). Includes API models: gpt-5.2, gemini-3.1-pro.')
     parser.add_argument('--debug-prompts', action='store_true',
                         help='Print full system prompt, instruction, and input for first 3-4 samples')
     parser.add_argument('--system-prompt-repeat', type=int, default=None, choices=[1, 2],
@@ -802,6 +991,8 @@ if __name__ == '__main__':
                         help='Exclude samples with no context_turns from evaluation (default: True)')
     parser.add_argument('--no-filter-no-context', action='store_false', dest='filter_no_context',
                         help='Do not filter; include samples with no context_turns')
+    parser.add_argument('--api-concurrency', type=int, default=32, metavar='N',
+                        help='Max concurrent API requests when using OpenAI/Gemini (default: 32)')
     args = parser.parse_args()
     main(
         dataset=args.dataset,
@@ -809,4 +1000,5 @@ if __name__ == '__main__':
         model=args.model,
         system_prompt_repeat=args.system_prompt_repeat,
         filter_no_context=args.filter_no_context,
+        api_concurrency=args.api_concurrency,
     )

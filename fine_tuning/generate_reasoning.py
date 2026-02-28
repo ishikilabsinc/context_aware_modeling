@@ -17,6 +17,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from utils.data_utils import filter_samples_with_context, load_samples
 
+from fine_tuning.sampling_utils import (
+    EQUAL_SAMPLING_SEED,
+    EQUAL_SAMPLING_SPGI_TARGET,
+    stratified_subsample_spgi,
+)
+
 TEACHER_SYSTEM_SUMMARY = """You are helping generate training data for a turn-taking prediction model.
 The model uses this framework: (1) ACTIVE PARTICIPANT = target speaker has been speaking, was addressed, or is part of the current exchange. (2) BYSTANDER = target speaker has not been involved and is passively listening. The model predicts whether the target speaker should SPEAK or STAY SILENT after a pause."""
 
@@ -220,6 +226,7 @@ def run_dataset(
     debug: bool = False,
     context_only: bool = False,
     workers: int = 1,
+    equal_sampling: bool = False,
 ) -> None:
     data_dir = REPO_ROOT / "data" / dataset
     train_file = data_dir / "train" / "train_samples.jsonl"
@@ -237,17 +244,26 @@ def run_dataset(
             print(f"  Skip {dataset}: no samples with context")
             return
         print(f"  {dataset}: filtering to {len(samples)} samples with context")
+    if dataset == "spgi" and equal_sampling and len(samples) > EQUAL_SAMPLING_SPGI_TARGET:
+        samples = stratified_subsample_spgi(
+            samples,
+            target_total=EQUAL_SAMPLING_SPGI_TARGET,
+            seed=EQUAL_SAMPLING_SEED,
+        )
+        print(f"  {dataset}: equal-sampling to {len(samples):,} samples (stratified 50/50 SPEAK/SILENT, category-proportional)")
     if dry_run is not None and dry_run > 0:
         samples = samples[: dry_run]
         print(f"  Dry run: processing first {len(samples)} samples only")
     client, gemini_model, gen_config = init_gemini(api_key, model_name=model_name)
-    completed = get_completed_ids(out_file) if resume and out_file.exists() else set()
+    # When equal_sampling for SPGI, write only the 11K subset so output file matches training; do not resume from a possibly full file.
+    use_fresh_output = dataset == "spgi" and equal_sampling
+    completed = set() if use_fresh_output else (get_completed_ids(out_file) if resume and out_file.exists() else set())
     to_process = [s for s in samples if (s.get("decision_point_id") or s.get("sequence_id") or str(id(s))) not in completed]
     if not to_process:
         print(f"  {dataset}: all {len(samples)} samples already in output (resume).")
         return
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    mode = "a" if resume and out_file.exists() else "w"
+    mode = "w" if use_fresh_output else ("a" if resume and out_file.exists() else "w")
     try:
         from tqdm import tqdm
     except ImportError:
@@ -370,6 +386,11 @@ def main():
         action="store_true",
         help="Process only train samples that have context_turns (non-empty conversation history).",
     )
+    parser.add_argument(
+        "--equal-sampling",
+        action="store_true",
+        help="For SPGI only: subsample to 11K (stratified 50/50 SPEAK/SILENT, category-proportional) before generating reasoning. Same selection as train_lora --dataset all --equal-sampling. Output file will contain only these 11K.",
+    )
     args = parser.parse_args()
     for dataset in args.datasets:
         run_dataset(
@@ -382,6 +403,7 @@ def main():
             debug=args.debug,
             context_only=args.context_only,
             workers=args.workers,
+            equal_sampling=args.equal_sampling,
         )
 
 

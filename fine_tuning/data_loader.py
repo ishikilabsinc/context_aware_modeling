@@ -361,65 +361,13 @@ from torch.utils.data import Sampler
 
 from utils.data_utils import load_samples, filter_samples_with_context
 
+from fine_tuning.sampling_utils import (
+    EQUAL_SAMPLING_SEED,
+    EQUAL_SAMPLING_SPGI_TARGET,
+    stratified_subsample_spgi as _stratified_subsample_spgi,
+)
+
 ALL_DATASETS = ["ami", "friends", "spgi"]
-
-# Target sizes for equal sampling (dataset=all): AMI and Friends kept as-is, SPGI subsampled to this.
-EQUAL_SAMPLING_SPGI_TARGET = 11_000
-EQUAL_SAMPLING_SEED = 42
-
-
-def _stratified_subsample_spgi(
-    samples: List[Dict],
-    target_total: int = EQUAL_SAMPLING_SPGI_TARGET,
-    seed: int = EQUAL_SAMPLING_SEED,
-) -> List[Dict]:
-    """Subsample SPGI to target_total preserving 50/50 SPEAK/SILENT and category proportions.
-    Categories: SPEAK_explicit, SPEAK_implicit, SILENT_ref, SILENT_no_ref.
-    """
-    if len(samples) <= target_total:
-        return list(samples)
-    rng = random.Random(seed)
-    speak = [s for s in samples if s.get("decision") == "SPEAK"]
-    silent = [s for s in samples if s.get("decision") == "SILENT"]
-    n_speak_target = target_total // 2
-    n_silent_target = target_total - n_speak_target
-
-    def _stratified_sample(pool: List[Dict], n_want: int) -> List[Dict]:
-        if not pool or n_want <= 0:
-            return []
-        if n_want >= len(pool):
-            return list(pool)
-        total = len(pool)
-        by_cat: Dict[str, List[Dict]] = {}
-        for s in pool:
-            cat = s.get("category") or "unknown"
-            by_cat.setdefault(cat, []).append(s)
-        # Proportional target per category, capped by available
-        sampled: List[Dict] = []
-        for cat, group in by_cat.items():
-            n_cat = min(len(group), max(0, int(round(n_want * len(group) / total))))
-            if n_cat > 0:
-                sampled.extend(rng.sample(group, n_cat))
-        # Fix size: add or remove to reach n_want (preserves approximate balance)
-        if len(sampled) < n_want:
-            remaining = [s for s in pool if s not in sampled]
-            sampled.extend(rng.sample(remaining, min(n_want - len(sampled), len(remaining))))
-        elif len(sampled) > n_want:
-            sampled = rng.sample(sampled, n_want)
-        return sampled
-
-    if len(speak) >= n_speak_target and len(silent) >= n_silent_target:
-        sampled_speak = _stratified_sample(speak, n_speak_target)
-        sampled_silent = _stratified_sample(silent, n_silent_target)
-    elif len(speak) < n_speak_target:
-        sampled_speak = list(speak)
-        sampled_silent = _stratified_sample(silent, min(len(silent), target_total - len(sampled_speak)))
-    else:
-        sampled_silent = list(silent)
-        sampled_speak = _stratified_sample(speak, min(len(speak), target_total - len(sampled_silent)))
-    result = sampled_speak + sampled_silent
-    rng.shuffle(result)
-    return result[:target_total]
 
 
 class BalancedBatchSampler(Sampler):
@@ -496,12 +444,102 @@ class DistributedBalancedBatchSampler(Sampler):
         return self.n_batches
 
 
+# 4-way category-balanced sampling: 25% each of SPEAK_explicit, SPEAK_implicit, SILENT_ref, SILENT_no_ref.
+FOUR_WAY_CATEGORIES = ["SPEAK_explicit", "SPEAK_implicit", "SILENT_ref", "SILENT_no_ref"]
+SAMPLES_PER_CATEGORY_PER_BATCH = 4  # batch size = 4 * 4 = 16
+
+
+def _draw_four_from_pool(pool: List[int], pos: int, shuffle: bool) -> tuple:
+    """Get 4 distinct indices from pool starting at pos. If not enough left, reshuffle pool and take from start. Returns (indices, new_pos)."""
+    need = SAMPLES_PER_CATEGORY_PER_BATCH
+    if pos + need <= len(pool):
+        indices = pool[pos : pos + need]
+        return indices, pos + need
+    # Exhausted: reshuffle and take 4 from the front (epoch-level replacement)
+    if shuffle:
+        random.shuffle(pool)
+    indices = pool[:need]
+    return indices, need
+
+
+class FourWayBalancedBatchSampler(Sampler):
+    """Batch sampler with 25% from each of SPEAK_explicit, SPEAK_implicit, SILENT_ref, SILENT_no_ref. When a pool is exhausted, reshuffle and continue (no duplicates within a batch)."""
+
+    def __init__(
+        self,
+        category_to_indices: Dict[str, List[int]],
+        shuffle: bool = True,
+    ):
+        self.category_to_indices = category_to_indices
+        self.shuffle = shuffle
+        self.pools = [category_to_indices[cat] for cat in FOUR_WAY_CATEGORIES]
+        max_pool = max(len(p) for p in self.pools)
+        self.n_batches = max_pool // SAMPLES_PER_CATEGORY_PER_BATCH
+
+    def __iter__(self):
+        pools = [list(p) for p in self.pools]
+        if self.shuffle:
+            for p in pools:
+                random.shuffle(p)
+        positions = [0] * 4
+        for _ in range(self.n_batches):
+            batch = []
+            for c in range(4):
+                indices, positions[c] = _draw_four_from_pool(pools[c], positions[c], self.shuffle)
+                batch.extend(indices)
+            random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self.n_batches
+
+
+class DistributedFourWayBalancedBatchSampler(Sampler):
+    """Distributed version: each rank gets a partition of each category pool; same 4-way logic per rank."""
+
+    def __init__(
+        self,
+        category_to_indices: Dict[str, List[int]],
+        rank: int,
+        world_size: int,
+        shuffle: bool = True,
+    ):
+        self.rank = rank
+        self.world_size = world_size
+        self.shuffle = shuffle
+        self.pools = []
+        for cat in FOUR_WAY_CATEGORIES:
+            indices = category_to_indices[cat]
+            my_indices = [indices[i] for i in range(rank, len(indices), world_size)]
+            self.pools.append(my_indices)
+        max_pool = max(len(p) for p in self.pools)
+        self.n_batches = max_pool // SAMPLES_PER_CATEGORY_PER_BATCH
+
+    def __iter__(self):
+        pools = [list(p) for p in self.pools]
+        if self.shuffle:
+            for p in pools:
+                random.shuffle(p)
+        positions = [0] * 4
+        for _ in range(self.n_batches):
+            batch = []
+            for c in range(4):
+                indices, positions[c] = _draw_four_from_pool(pools[c], positions[c], self.shuffle)
+                batch.extend(indices)
+            random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self.n_batches
+
+
 def prepare_datasets(
     tokenizer: AutoTokenizer,
     max_length: int = 2048,
     debug: bool = False,
     batch_size: int = None,
     use_balanced_batches: bool = True,
+    four_way_balanced: bool = True,
     rank: int = None,
     world_size: int = None,
     silent_ratio_in_batch: float = 0.5,
@@ -633,32 +671,57 @@ def prepare_datasets(
 
     batch_sampler = None
     if use_balanced_batches and batch_size is not None and batch_size >= 2:
-        speak_idx = [i for i, s in enumerate(train_samples) if s.get("decision") == "SPEAK"]
-        silent_idx = [i for i, s in enumerate(train_samples) if s.get("decision") == "SILENT"]
-        n_silent = max(1, min(batch_size - 1, round(batch_size * silent_ratio_in_batch)))
-        n_speak = batch_size - n_silent
-        if len(speak_idx) >= n_speak and len(silent_idx) >= n_silent:
-            if rank is not None and world_size is not None:
-                batch_sampler = DistributedBalancedBatchSampler(
-                    speak_idx, silent_idx, batch_size, rank, world_size, shuffle=True,
-                    silent_ratio_in_batch=silent_ratio_in_batch,
-                )
-                n_batches = len(batch_sampler)
-                if rank == 0:
-                    pct = int(round(100 * silent_ratio_in_batch))
-                    print(f"  Distributed balanced batch sampler (world_size={world_size}): {n_batches:,} batches/rank (~{pct}% SILENT / {100-pct}% SPEAK per batch)")
+        if four_way_balanced:
+            category_to_indices: Dict[str, List[int]] = {cat: [] for cat in FOUR_WAY_CATEGORIES}
+            for i, s in enumerate(train_samples):
+                cat = s.get("category")
+                if cat in category_to_indices:
+                    category_to_indices[cat].append(i)
+            min_per_cat = min(len(category_to_indices[cat]) for cat in FOUR_WAY_CATEGORIES)
+            if min_per_cat >= SAMPLES_PER_CATEGORY_PER_BATCH:
+                if rank is not None and world_size is not None:
+                    batch_sampler = DistributedFourWayBalancedBatchSampler(
+                        category_to_indices, rank, world_size, shuffle=True,
+                    )
+                    n_batches = len(batch_sampler)
+                    if rank == 0:
+                        print(f"  Distributed 4-way balanced batch sampler (world_size={world_size}): {n_batches:,} batches/rank (25% each: SPEAK_explicit, SPEAK_implicit, SILENT_ref, SILENT_no_ref)")
+                else:
+                    batch_sampler = FourWayBalancedBatchSampler(category_to_indices, shuffle=True)
+                    n_batches = len(batch_sampler)
+                    print(f"  4-way balanced batch sampler: {n_batches:,} batches (25% each: SPEAK_explicit, SPEAK_implicit, SILENT_ref, SILENT_no_ref)")
             else:
-                batch_sampler = BalancedBatchSampler(
-                    speak_idx, silent_idx, batch_size, shuffle=True,
-                    silent_ratio_in_batch=silent_ratio_in_batch,
-                )
-                n_batches = len(batch_sampler)
-                pct = int(round(100 * silent_ratio_in_batch))
-                print(f"  Balanced batch sampler: {n_batches:,} batches (~{pct}% SILENT / {100-pct}% SPEAK per batch)")
-        else:
-            print("  Skipping balanced batches (not enough SPEAK or SILENT samples); using default shuffling")
+                if rank is None or rank == 0:
+                    print(f"  Skipping 4-way balanced (need >= {SAMPLES_PER_CATEGORY_PER_BATCH} per category; min={min_per_cat}); falling back to binary balancing")
+                four_way_balanced = False
+        if not four_way_balanced:
+            speak_idx = [i for i, s in enumerate(train_samples) if s.get("decision") == "SPEAK"]
+            silent_idx = [i for i, s in enumerate(train_samples) if s.get("decision") == "SILENT"]
+            n_silent = max(1, min(batch_size - 1, round(batch_size * silent_ratio_in_batch)))
+            n_speak = batch_size - n_silent
+            if len(speak_idx) >= n_speak and len(silent_idx) >= n_silent:
+                if rank is not None and world_size is not None:
+                    batch_sampler = DistributedBalancedBatchSampler(
+                        speak_idx, silent_idx, batch_size, rank, world_size, shuffle=True,
+                        silent_ratio_in_batch=silent_ratio_in_batch,
+                    )
+                    n_batches = len(batch_sampler)
+                    if rank == 0:
+                        pct = int(round(100 * silent_ratio_in_batch))
+                        print(f"  Distributed balanced batch sampler (world_size={world_size}): {n_batches:,} batches/rank (~{pct}% SILENT / {100-pct}% SPEAK per batch)")
+                else:
+                    batch_sampler = BalancedBatchSampler(
+                        speak_idx, silent_idx, batch_size, shuffle=True,
+                        silent_ratio_in_batch=silent_ratio_in_batch,
+                    )
+                    n_batches = len(batch_sampler)
+                    pct = int(round(100 * silent_ratio_in_batch))
+                    print(f"  Balanced batch sampler: {n_batches:,} batches (~{pct}% SILENT / {100-pct}% SPEAK per batch)")
+            else:
+                if rank is None or rank == 0:
+                    print("  Skipping balanced batches (not enough SPEAK or SILENT samples); using default shuffling")
 
-    return train_dataset, val_dataset, batch_sampler
+    return train_dataset, val_dataset, batch_sampler, train_samples
 
 
 

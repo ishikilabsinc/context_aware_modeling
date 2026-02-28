@@ -260,6 +260,7 @@ def evaluate_samples(samples: List[Dict], model, tokenizer, mode: str = TRAINING
     rec_silent = true_negatives / (true_negatives + false_positives) if (true_negatives + false_positives) > 0 else 0.0
     f1_silent = 2 * prec_silent * rec_silent / (prec_silent + rec_silent) if (prec_silent + rec_silent) > 0 else 0.0
     macro_f1 = (f1_speak + f1_silent) / 2.0
+    balanced_accuracy = (rec_speak + rec_silent) / 2.0
 
     results = {
         'total_samples': len(all_predictions),
@@ -267,6 +268,7 @@ def evaluate_samples(samples: List[Dict], model, tokenizer, mode: str = TRAINING
         'correct': correct,
         'incorrect': len(all_predictions) - correct,
         'macro_f1': macro_f1,
+        'balanced_accuracy': balanced_accuracy,
         'category_accuracy': {
             cat: {
                 'accuracy': m['correct'] / m['total'] if m['total'] > 0 else 0,
@@ -310,15 +312,23 @@ def load_baseline_results(baseline_file: Path) -> Optional[Dict]:
 
 
 def compare_results(baseline: Dict, finetuned: Dict) -> Dict:
+    baseline_macro_f1 = baseline.get('macro_f1', 0)
+    baseline_bal_acc = baseline.get('balanced_accuracy', baseline.get('macro_accuracy', 0))
+    finetuned_macro_f1 = finetuned.get('macro_f1', 0)
+    finetuned_bal_acc = finetuned.get('balanced_accuracy', 0)
     comparison = {
         'baseline': {
             'accuracy': baseline.get('accuracy', 0),
+            'macro_f1': baseline_macro_f1,
+            'balanced_accuracy': baseline_bal_acc,
             'false_positive_rate': baseline.get('false_positive_rate', 0),
             'false_negative_rate': baseline.get('false_negative_rate', 0),
             'latency_mean': baseline.get('latency_stats', {}).get('mean', 0),
         },
         'finetuned': {
             'accuracy': finetuned.get('accuracy', 0),
+            'macro_f1': finetuned_macro_f1,
+            'balanced_accuracy': finetuned_bal_acc,
             'false_positive_rate': finetuned.get('false_positive_rate', 0),
             'false_negative_rate': finetuned.get('false_negative_rate', 0),
             'latency_mean': finetuned.get('latency_stats', {}).get('mean', 0),
@@ -326,6 +336,8 @@ def compare_results(baseline: Dict, finetuned: Dict) -> Dict:
         'improvements': {
             'accuracy_delta': finetuned.get('accuracy', 0) - baseline.get('accuracy', 0),
             'accuracy_improvement_pct': ((finetuned.get('accuracy', 0) - baseline.get('accuracy', 0)) / max(baseline.get('accuracy', 0), 0.01)) * 100 if baseline.get('accuracy', 0) > 0 else 0,
+            'macro_f1_delta': finetuned_macro_f1 - baseline_macro_f1,
+            'balanced_accuracy_delta': finetuned_bal_acc - baseline_bal_acc,
             'fpr_delta': finetuned.get('false_positive_rate', 0) - baseline.get('false_positive_rate', 0),
             'fnr_delta': finetuned.get('false_negative_rate', 0) - baseline.get('false_negative_rate', 0),
             'latency_delta': finetuned.get('latency_stats', {}).get('mean', 0) - baseline.get('latency_stats', {}).get('mean', 0),
