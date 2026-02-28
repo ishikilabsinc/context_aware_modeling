@@ -212,7 +212,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 
 # Inference settings
 BATCH_SIZE = 32 if USE_VLLM else 1  # vLLM supports batching, transformers doesn't
-MAX_NEW_TOKENS = 256  # Same for all models (fair comparison)
+MAX_NEW_TOKENS = 2048  # Same for all models (fair comparison); 512 avoids truncation before <decision> for API models
 TEMPERATURE = 0.0 # No temperature for deterministic decisions
 STOP_AFTER_DECISION = True # Stop after the decision is made to save time
 
