@@ -183,8 +183,9 @@ def setup_model_and_tokenizer(lora_rank=None, use_fsdp=False, local_rank=-1):
 
 
 
-def _make_compute_metrics(tokenizer, eval_predictions_path=None):
+def _make_compute_metrics(tokenizer, eval_predictions_path=None, model_key=None):
     import numpy as np
+    use_logit_pos_minus_one = model_key == "gpt-oss-20b"
     speak_ids = tokenizer.encode("SPEAK", add_special_tokens=False)
     silent_ids = tokenizer.encode("SILENT", add_special_tokens=False)
     speak_id = int(speak_ids[1]) if len(speak_ids) >= 2 else (int(speak_ids[-1]) if speak_ids else -1)
@@ -234,7 +235,9 @@ def _make_compute_metrics(tokenizer, eval_predictions_path=None):
                 if pos is None:
                     continue
                 y_true.append(1 if labels[i, pos] == speak_id else 0)
-                y_pred.append(1 if pred_tokens[i, pos] == speak_id else 0)
+                # gpt-oss-20b: logits at t predict token at t+1; use pred at pos-1 for label at pos
+                pred_pos = (pos - 1) if (pos >= 1 and use_logit_pos_minus_one) else pos
+                y_pred.append(1 if pred_tokens[i, pred_pos] == speak_id else 0)
             y_true = np.array(y_true) if y_true else np.array([])
             y_pred = np.array(y_pred) if y_pred else np.array([])
         if len(y_true) == 0:
@@ -313,8 +316,9 @@ class EvalSummaryCallback(TrainerCallback):
 
 
 class LogTargetVsPredictedCallback(TrainerCallback):
-    def __init__(self, n_samples=4):
+    def __init__(self, n_samples=4, model_key=None):
         self.n_samples = n_samples
+        self._model_key = model_key
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         trainer = getattr(self, "trainer", None)
@@ -369,7 +373,9 @@ class LogTargetVsPredictedCallback(TrainerCallback):
                     else:
                         target_str = "SPEAK" if labels[i, pos].item() == speak_id else "SILENT"
                         if speak_id < V and silent_id < V:
-                            pred_str = "SPEAK" if logits[i, pos, speak_id].item() >= logits[i, pos, silent_id].item() else "SILENT"
+                            # gpt-oss-20b only: logits at t predict token at t+1
+                            logit_pos = (pos - 1) if (pos >= 1 and getattr(self, "_model_key", None) == "gpt-oss-20b") else pos
+                            pred_str = "SPEAK" if logits[i, logit_pos, speak_id].item() >= logits[i, logit_pos, silent_id].item() else "SILENT"
                         else:
                             pred_str = "?"
                     ok = "ok" if target_str == pred_str else "wrong"
@@ -401,10 +407,11 @@ class LogTargetVsPredictedCallback(TrainerCallback):
 
 
 class TrainerWithBalancedBatches(Trainer):
-    def __init__(self, train_batch_sampler=None, tokenizer=None, **kwargs):
+    def __init__(self, train_batch_sampler=None, tokenizer=None, model_key=None, **kwargs):
         super().__init__(**kwargs)
         self.train_batch_sampler = train_batch_sampler
         self._tokenizer = tokenizer
+        self._use_logit_pos_minus_one = model_key == "gpt-oss-20b"
         self._speak_id = None
         self._silent_id = None
         if tokenizer is not None:
@@ -441,7 +448,9 @@ class TrainerWithBalancedBatches(Trainer):
                 continue
             true_classes.append(1 if labels[i, pos].item() == speak_id else 0)
             if speak_id >= 0 and silent_id >= 0 and speak_id < V and silent_id < V:
-                pred_classes.append(1 if logits[i, pos, speak_id].item() >= logits[i, pos, silent_id].item() else 0)
+                # gpt-oss-20b only: logits at t predict token at t+1; use logits at pos-1 for label at pos
+                logit_pos = (pos - 1) if (pos >= 1 and self._use_logit_pos_minus_one) else pos
+                pred_classes.append(1 if logits[i, logit_pos, speak_id].item() >= logits[i, logit_pos, silent_id].item() else 0)
             else:
                 pred_classes.append(0)
         out = torch.tensor(pred_classes, dtype=torch.long, device=logits.device)
@@ -593,9 +602,13 @@ def main(
         training_config["optim"] = "adamw_torch"
 
     if resume_from_checkpoint:
-        state_path = Path(resume_from_checkpoint) / "trainer_state.json"
+        resume_path = Path(resume_from_checkpoint)
+        if not resume_path.is_absolute():
+            resume_path = run_output_dir / resume_path
+        state_path = resume_path / "trainer_state.json"
         if not state_path.exists():
             raise FileNotFoundError(f"Resume checkpoint missing trainer_state.json: {state_path}")
+        resume_from_checkpoint = str(resume_path)
         with open(state_path) as f:
             trainer_state = json.load(f)
         global_step = trainer_state.get("global_step", 0)
@@ -624,8 +637,9 @@ def main(
     compute_metrics_fn = _make_compute_metrics(
         tokenizer,
         eval_predictions_path=run_output_dir / "eval_predictions.txt",
+        model_key=MODEL,
     )
-    callbacks = [EvalSummaryCallback(), LogTargetVsPredictedCallback(n_samples=4)]
+    callbacks = [EvalSummaryCallback(), LogTargetVsPredictedCallback(n_samples=4, model_key=MODEL)]
     if (
         training_config.get("eval_strategy") != "no"
         and not resume_from_checkpoint
@@ -642,6 +656,7 @@ def main(
         compute_metrics=compute_metrics_fn,
         train_batch_sampler=train_batch_sampler,
         tokenizer=tokenizer,
+        model_key=MODEL,
         callbacks=callbacks,
     )
     if hasattr(trainer.model, "gradient_checkpointing_disable"):

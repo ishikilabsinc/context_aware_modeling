@@ -142,7 +142,13 @@ def infer_with_model_batch(
 
 
 
-def evaluate_samples(samples: List[Dict], model, tokenizer, mode: str = TRAINING_MODE_DECISION_ONLY) -> Dict:
+def evaluate_samples(
+    samples: List[Dict],
+    model,
+    tokenizer,
+    mode: str = TRAINING_MODE_DECISION_ONLY,
+    model_key: Optional[str] = None,
+) -> Dict:
     if mode not in TRAINING_MODES:
         raise ValueError(f"mode must be one of {TRAINING_MODES}, got {mode!r}")
     print(f"\nEvaluating {len(samples)} samples...")
@@ -154,7 +160,11 @@ def evaluate_samples(samples: List[Dict], model, tokenizer, mode: str = TRAINING
     print(f"Eval mode: {mode}")
 
     use_cot = mode == TRAINING_MODE_COT
-    max_tokens = MAX_NEW_TOKENS_COT if use_cot else MAX_NEW_TOKENS
+    # gpt-oss-20b only: allow up to 8192 new tokens; other models use default
+    if model_key == "gpt-oss-20b":
+        max_tokens = 8192
+    else:
+        max_tokens = MAX_NEW_TOKENS_COT if use_cot else MAX_NEW_TOKENS
     stop_sequences = STOP_SEQUENCES_COT if use_cot else STOP_SEQUENCES
 
     prompts = [
@@ -431,7 +441,7 @@ def main(
         print("No samples left after filtering. Exiting.")
         return None
 
-    results = evaluate_samples(samples, model_obj, tokenizer, mode=mode)
+    results = evaluate_samples(samples, model_obj, tokenizer, mode=mode, model_key=model_key)
 
     print("\n" + "=" * 70)
     print("EVALUATION RESULTS")
