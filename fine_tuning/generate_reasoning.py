@@ -360,14 +360,14 @@ def main():
         type=float,
         default=5.0,
         metavar="SECS",
-        help="Seconds between API call starts (default: 5.0). Free tier ~15 RPM; use lower only with higher quota.",
+        help="Seconds between API call starts (default: 5.0). Throughput ~1/delay req/s (e.g. 5->12/min, 1->60/min). Use 1.0 for 60 RPM paid quota to cut SPGI 79K from ~100h to ~22h.",
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=1,
         metavar="N",
-        help="Number of concurrent API requests (default: 1). Higher values speed up if quota allows; rate limit is still respected.",
+        help="Concurrent API workers (default: 1). Keep high (e.g. 64); global rate is still 1/delay req/s.",
     )
     parser.add_argument(
         "--debug",
@@ -389,7 +389,7 @@ def main():
     parser.add_argument(
         "--equal-sampling",
         action="store_true",
-        help="For SPGI only: subsample to 11K (stratified 50/50 SPEAK/SILENT, category-proportional) before generating reasoning. Same selection as train_lora --dataset all --equal-sampling. Output file will contain only these 11K.",
+        help="For SPGI only: subsample to 11K (stratified 50/50 SPEAK/SILENT). Same as train_lora --equal_sampling. Use with --context-only to cut 79K to 11K and run ~7x faster.",
     )
     args = parser.parse_args()
     for dataset in args.datasets:

@@ -11,6 +11,7 @@ except RuntimeError:
 import argparse
 import json
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -296,6 +297,61 @@ def evaluate_samples(
     return results
 
 
+def compute_metrics_from_predictions(all_predictions: List[Dict]) -> Dict:
+    """Build full results dict from a list of prediction dicts (e.g. after merging shards)."""
+    if not all_predictions:
+        return {
+            'total_samples': 0, 'accuracy': 0, 'correct': 0, 'incorrect': 0,
+            'macro_f1': 0, 'balanced_accuracy': 0, 'category_accuracy': {},
+            'confusion_matrix': {}, 'latency_stats': {},
+            'false_positive_rate': 0, 'false_negative_rate': 0, 'predictions': [],
+        }
+    all_latencies = [p.get('latency', 0) for p in all_predictions]
+    category_metrics = defaultdict(lambda: {'correct': 0, 'total': 0})
+    for pred in all_predictions:
+        cat = pred['category']
+        category_metrics[cat]['total'] += 1
+        if pred['prediction'] == pred['ground_truth']:
+            category_metrics[cat]['correct'] += 1
+    correct = sum(1 for p in all_predictions if p['prediction'] == p['ground_truth'])
+    accuracy = correct / len(all_predictions)
+    confusion = defaultdict(int)
+    for pred in all_predictions:
+        key = f"{pred['ground_truth']}_->_{pred['prediction']}"
+        confusion[key] += 1
+    latencies = np.array(all_latencies)
+    latency_stats = {
+        'mean': float(np.mean(latencies)), 'median': float(np.median(latencies)),
+        'p50': float(np.percentile(latencies, 50)), 'p95': float(np.percentile(latencies, 95)),
+        'p99': float(np.percentile(latencies, 99)), 'min': float(np.min(latencies)),
+        'max': float(np.max(latencies)),
+    }
+    false_positives = sum(1 for p in all_predictions if p['ground_truth'] == 'SILENT' and p['prediction'] == 'SPEAK')
+    false_negatives = sum(1 for p in all_predictions if p['ground_truth'] == 'SPEAK' and p['prediction'] == 'SILENT')
+    true_positives = sum(1 for p in all_predictions if p['ground_truth'] == 'SPEAK' and p['prediction'] == 'SPEAK')
+    true_negatives = sum(1 for p in all_predictions if p['ground_truth'] == 'SILENT' and p['prediction'] == 'SILENT')
+    total_silent = sum(1 for p in all_predictions if p['ground_truth'] == 'SILENT')
+    total_speak = sum(1 for p in all_predictions if p['ground_truth'] == 'SPEAK')
+    fpr = false_positives / total_silent if total_silent > 0 else 0
+    fnr = false_negatives / total_speak if total_speak > 0 else 0
+    prec_speak = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
+    rec_speak = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
+    f1_speak = 2 * prec_speak * rec_speak / (prec_speak + rec_speak) if (prec_speak + rec_speak) > 0 else 0.0
+    prec_silent = true_negatives / (true_negatives + false_negatives) if (true_negatives + false_negatives) > 0 else 0.0
+    rec_silent = true_negatives / (true_negatives + false_positives) if (true_negatives + false_positives) > 0 else 0.0
+    f1_silent = 2 * prec_silent * rec_silent / (prec_silent + rec_silent) if (prec_silent + rec_silent) > 0 else 0.0
+    macro_f1 = (f1_speak + f1_silent) / 2.0
+    balanced_accuracy = (rec_speak + rec_silent) / 2.0
+    return {
+        'total_samples': len(all_predictions), 'accuracy': accuracy, 'correct': correct,
+        'incorrect': len(all_predictions) - correct, 'macro_f1': macro_f1,
+        'balanced_accuracy': balanced_accuracy,
+        'category_accuracy': {cat: {'accuracy': m['correct'] / m['total'] if m['total'] > 0 else 0, 'correct': m['correct'], 'total': m['total']} for cat, m in category_metrics.items()},
+        'confusion_matrix': dict(confusion), 'latency_stats': latency_stats,
+        'false_positive_rate': fpr, 'false_negative_rate': fnr, 'predictions': all_predictions,
+    }
+
+
 
 def find_baseline_results(baseline_dir: Path, dataset: str, model_key: str) -> Optional[Path]:
     for name in [
@@ -382,6 +438,8 @@ def main(
     lora_rank: Optional[int] = None,
     mode: str = TRAINING_MODE_DECISION_ONLY,
     filter_no_context: bool = True,
+    shard_index: Optional[int] = None,
+    num_shards: Optional[int] = None,
 ):
     if mode not in TRAINING_MODES:
         raise ValueError(f"mode must be one of {TRAINING_MODES}, got {mode!r}")
@@ -422,13 +480,6 @@ def main(
         print(f"LoRA rank run: r{lora_rank}")
     print("=" * 70)
 
-    print("\nLoading fine-tuned model...")
-    model_obj, tokenizer = load_finetuned_model(
-        use_vllm=USE_VLLM,
-        adapter_path=adapter_path,
-        lora_rank=lora_rank,
-    )
-
     print(f"\nLoading samples from {EVAL_FILE}...")
     samples = load_samples(EVAL_FILE)
     print(f"Loaded {len(samples)} samples")
@@ -441,7 +492,76 @@ def main(
         print("No samples left after filtering. Exiting.")
         return None
 
-    results = evaluate_samples(samples, model_obj, tokenizer, mode=mode, model_key=model_key)
+    use_multi_gpu = (
+        model_key == "gpt-oss-20b"
+        and dataset == "spgi"
+        and shard_index is None
+        and num_shards is None
+    )
+    if use_multi_gpu:
+        num_gpus = int(os.environ.get("NUM_EVAL_GPUS", "8"))
+        print(f"\nMulti-GPU eval: spawning {num_gpus} workers (gpt-oss-20b + spgi)...")
+        script = Path(__file__).resolve()
+        cmd_base = [
+            sys.executable, str(script),
+            "--dataset", dataset, "--model", model_key, "--mode", mode,
+        ]
+        if checkpoint:
+            cmd_base += ["--checkpoint", checkpoint]
+        if lora_rank is not None:
+            cmd_base += ["--lora-rank", str(lora_rank)]
+        if filter_no_context:
+            cmd_base += ["--filter-no-context"]
+        else:
+            cmd_base += ["--no-filter-no-context"]
+        processes = []
+        for i in range(num_gpus):
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(i)
+            proc = subprocess.Popen(
+                cmd_base + ["--shard-index", str(i), "--num-shards", str(num_gpus)],
+                env=env,
+                cwd=str(BASE_DIR),
+            )
+            processes.append((i, proc))
+        for i, proc in processes:
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(f"Shard {i} exited with code {proc.returncode}")
+        n_total = len(samples)
+        full_predictions = [None] * n_total
+        for i in range(num_gpus):
+            shard_path = RESULTS_FILE.parent / (RESULTS_FILE.stem + f"_shard_{i}.json")
+            with open(shard_path, "r") as f:
+                data = json.load(f)
+            for k, p in enumerate(data["predictions"]):
+                orig_idx = i + k * num_gpus
+                full_predictions[orig_idx] = p
+            shard_path.unlink(missing_ok=True)
+        results = compute_metrics_from_predictions(full_predictions)
+    elif shard_index is not None and num_shards is not None:
+        samples = samples[shard_index::num_shards]
+        print(f"\nShard {shard_index}/{num_shards}: evaluating {len(samples)} samples on GPU {shard_index}...")
+        print("Loading fine-tuned model...")
+        model_obj, tokenizer = load_finetuned_model(
+            use_vllm=USE_VLLM,
+            adapter_path=adapter_path,
+            lora_rank=lora_rank,
+        )
+        results = evaluate_samples(samples, model_obj, tokenizer, mode=mode, model_key=model_key)
+        shard_path = RESULTS_FILE.parent / (RESULTS_FILE.stem + f"_shard_{shard_index}.json")
+        with open(shard_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Shard {shard_index} saved to {shard_path}")
+        return None
+    else:
+        print("\nLoading fine-tuned model...")
+        model_obj, tokenizer = load_finetuned_model(
+            use_vllm=USE_VLLM,
+            adapter_path=adapter_path,
+            lora_rank=lora_rank,
+        )
+        results = evaluate_samples(samples, model_obj, tokenizer, mode=mode, model_key=model_key)
 
     print("\n" + "=" * 70)
     print("EVALUATION RESULTS")
@@ -474,7 +594,7 @@ def main(
     # Human-readable target vs predicted for every sample (same stem as JSON, .txt)
     target_vs_pred_path = RESULTS_FILE.with_suffix(".target_vs_predicted.txt")
     with open(target_vs_pred_path, "w", encoding="utf-8") as f:
-        f.write(f"Target vs predicted — {dataset} test set, model {model_key}{f' r{lora_rank}' if lora_rank is not None else ''}\n")
+        f.write(f"Target vs predicted - {dataset} test set, model {model_key}{f' r{lora_rank}' if lora_rank is not None else ''}\n")
         f.write(f"Total: {results['total_samples']}  Correct: {results['correct']}  Accuracy: {results['accuracy']:.2%}\n\n")
         for i, p in enumerate(results["predictions"]):
             target = p.get("ground_truth", "?")
@@ -490,7 +610,7 @@ def main(
     if mode == TRAINING_MODE_COT:
         reasoning_path = RESULTS_FILE.with_name(RESULTS_FILE.stem + "_reasoning.txt")
         with open(reasoning_path, "w", encoding="utf-8") as f:
-            f.write(f"Generated reasoning — {dataset} test set, model {model_key}{f' r{lora_rank}' if lora_rank else ''} (CoT)\n\n")
+            f.write(f"Generated reasoning - {dataset} test set, model {model_key}{f' r{lora_rank}' if lora_rank else ''} (CoT)\n\n")
             for i, p in enumerate(results["predictions"]):
                 sid = p.get("sample_id", f"sample_{i}")
                 target = p.get("ground_truth", "?")
@@ -592,6 +712,20 @@ if __name__ == "__main__":
         dest="filter_no_context",
         help="Do not filter; include samples with no context_turns.",
     )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        metavar="I",
+        help="(Internal) Evaluate only shard I when using multi-GPU (0-based).",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        metavar="N",
+        help="(Internal) Total number of shards for multi-GPU eval.",
+    )
     args = parser.parse_args()
     dataset = args.dataset or os.environ.get("DATASET", "ami")
     main(
@@ -601,4 +735,6 @@ if __name__ == "__main__":
         lora_rank=args.lora_rank,
         mode=args.mode,
         filter_no_context=args.filter_no_context,
+        shard_index=args.shard_index,
+        num_shards=args.num_shards,
     )

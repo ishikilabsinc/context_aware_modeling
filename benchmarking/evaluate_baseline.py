@@ -13,7 +13,7 @@ import os
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
 from collections import defaultdict
 import numpy as np
 
@@ -31,10 +31,8 @@ BENCHMARK_MODEL_OPTIONS = {**MODEL_OPTIONS, **API_MODEL_OPTIONS}
 
 
 def is_api_model(model_id: str) -> bool:
-    """True if model_id denotes an API model (OpenAI or Google)."""
-    return isinstance(model_id, str) and (
-        model_id.startswith("openai/") or model_id.startswith("google/")
-    )
+    """True if model_id denotes an API model (OpenAI or Google). Uses explicit API set so openai/gpt-oss-20b (HF) is not treated as API."""
+    return model_id in API_MODEL_OPTIONS.values()
 
 
 def _call_openai(model_name: str, system_content: str, user_content: str) -> Tuple[str, float]:
@@ -114,12 +112,41 @@ def _call_gemini(model_name: str, system_content: str, user_content: str) -> Tup
                 raise
 
 
+def _prediction_dict_from_result(sample: Dict, output_text: str, latency: float) -> Dict:
+    """Build a single prediction dict (same shape as in evaluate_samples_api). Used for checkpointing."""
+    prediction = extract_decision_from_output(output_text)
+    ground_truth = sample.get('decision', 'UNKNOWN')
+    context_turns_list = sample.get('context_turns', [])
+    if len(context_turns_list) > MAX_CONTEXT_TURNS_IN_RESULTS:
+        context_turns_display = context_turns_list[-MAX_CONTEXT_TURNS_IN_RESULTS:]
+        context_turns_total = len(context_turns_list)
+    else:
+        context_turns_display = context_turns_list
+        context_turns_total = len(context_turns_list)
+    return {
+        'sample_id': sample.get('decision_point_id', ''),
+        'ground_truth': ground_truth,
+        'prediction': prediction,
+        'category': sample.get('category', 'UNKNOWN'),
+        'output_text': output_text,
+        'latency': latency,
+        'target_speaker': sample.get('target_speaker', 'N/A'),
+        'all_speakers': sample.get('all_speakers', []),
+        'context_turns': context_turns_display,
+        'context_turns_total': context_turns_total,
+        'current_turn': sample.get('current_turn', {}),
+        'confidence': sample.get('confidence', 'N/A'),
+    }
+
+
 def _infer_api(
     samples: List[Dict],
     model_id: str,
     api_concurrency: int = 32,
+    on_sample_done: Optional[Callable[[Dict, str, float], None]] = None,
 ) -> List[Tuple[str, float]]:
-    """Run API inference for all samples in parallel. Returns list of (output_text, latency) in sample order."""
+    """Run API inference for all samples in parallel. Returns list of (output_text, latency) in sample order.
+    If on_sample_done is set, it is called for each (sample, output_text, latency) as results complete (for checkpointing)."""
     if model_id.startswith("openai/"):
         model_name = model_id.split("/", 1)[1]
         caller = lambda s, u: _call_openai(model_name, s, u)
@@ -145,7 +172,10 @@ def _infer_api(
         futures = {executor.submit(do_one, i): i for i in range(n)}
         for future in as_completed(futures):
             idx, result = future.result()
+            text, lat = result
             index_to_result[idx] = result
+            if on_sample_done is not None:
+                on_sample_done(samples[idx], text, lat)
             completed += 1
             if completed % progress_interval == 0 or completed == n:
                 print(f"  Processed {completed}/{n} samples...", flush=True)
@@ -153,55 +183,92 @@ def _infer_api(
     return [index_to_result[i] for i in range(n)]
 
 
+CHECKPOINT_SAVE_INTERVAL = 50  # Save checkpoint every N API completions (API models only)
+
+
 def evaluate_samples_api(
     samples: List[Dict],
     model_id: str,
     debug_prompts: bool = False,
     api_concurrency: int = 32,
+    checkpoint_path: Optional[Path] = None,
 ) -> List[Dict]:
-    """Evaluate samples using OpenAI or Gemini API. Returns same prediction list shape as evaluate_samples."""
-    print(f"\nEvaluating {len(samples)} samples via API ({model_id}) (concurrency={api_concurrency})...")
-    batch_results = _infer_api(samples, model_id, api_concurrency=api_concurrency)
-    all_predictions = []
-    for (output_text, latency), sample in zip(batch_results, samples):
-        prediction = extract_decision_from_output(output_text)
-        ground_truth = sample.get('decision', 'UNKNOWN')
-        context_turns_list = sample.get('context_turns', [])
-        if len(context_turns_list) > MAX_CONTEXT_TURNS_IN_RESULTS:
-            context_turns_display = context_turns_list[-MAX_CONTEXT_TURNS_IN_RESULTS:]
-            context_turns_total = len(context_turns_list)
-        else:
-            context_turns_display = context_turns_list
-            context_turns_total = len(context_turns_list)
-        all_predictions.append({
-            'sample_id': sample.get('decision_point_id', ''),
-            'ground_truth': ground_truth,
-            'prediction': prediction,
-            'category': sample.get('category', 'UNKNOWN'),
-            'output_text': output_text,
-            'latency': latency,
-            'target_speaker': sample.get('target_speaker', 'N/A'),
-            'all_speakers': sample.get('all_speakers', []),
-            'context_turns': context_turns_display,
-            'context_turns_total': context_turns_total,
-            'current_turn': sample.get('current_turn', {}),
-            'confidence': sample.get('confidence', 'N/A'),
-        })
-    # Same summary stats as evaluate_samples
+    """Evaluate samples using OpenAI or Gemini API. Returns same prediction list shape as evaluate_samples.
+    If checkpoint_path is set (API runs only), progress is saved incrementally and a rerun resumes from the checkpoint."""
+    n_total = len(samples)
+    predictions_by_id: Dict[str, Dict] = {}
+    if checkpoint_path is not None and checkpoint_path.exists():
+        try:
+            with open(checkpoint_path, "r") as f:
+                data = json.load(f)
+            predictions_by_id = data.get("predictions_by_id", {})
+            if predictions_by_id:
+                print(f"  Resuming from checkpoint: {len(predictions_by_id)}/{n_total} samples already done.")
+        except Exception as e:
+            print(f"  Warning: could not load checkpoint ({e}), starting from scratch.", flush=True)
+            predictions_by_id = {}
+
+    completed_ids = set(predictions_by_id.keys())
+    samples_to_run = [s for s in samples if s.get("decision_point_id") not in completed_ids]
+    if not samples_to_run:
+        print(f"  All {n_total} samples already in checkpoint; nothing to run.")
+        all_predictions = [predictions_by_id[s["decision_point_id"]] for s in samples]
+        _print_prediction_summary(all_predictions)
+        return all_predictions
+
+    n_remaining = len(samples_to_run)
+    print(f"\nEvaluating {n_remaining} samples via API ({model_id}) (concurrency={api_concurrency})...")
+    if completed_ids:
+        print(f"  (Skipping {len(completed_ids)} already completed.)")
+
+    def on_sample_done(sample: Dict, output_text: str, latency: float) -> None:
+        pred = _prediction_dict_from_result(sample, output_text, latency)
+        sid = sample.get("decision_point_id", "")
+        predictions_by_id[sid] = pred
+        if checkpoint_path is not None and len(predictions_by_id) % CHECKPOINT_SAVE_INTERVAL == 0:
+            try:
+                with open(checkpoint_path, "w") as f:
+                    json.dump({"predictions_by_id": predictions_by_id}, f, indent=2)
+            except Exception:
+                pass  # Don't fail the run if checkpoint write fails
+
+    batch_results = _infer_api(
+        samples_to_run,
+        model_id,
+        api_concurrency=api_concurrency,
+        on_sample_done=on_sample_done,
+    )
+    for (output_text, latency), sample in zip(batch_results, samples_to_run):
+        sid = sample.get("decision_point_id", "")
+        if sid not in predictions_by_id:
+            predictions_by_id[sid] = _prediction_dict_from_result(sample, output_text, latency)
+    if checkpoint_path is not None:
+        try:
+            with open(checkpoint_path, "w") as f:
+                json.dump({"predictions_by_id": predictions_by_id}, f, indent=2)
+        except Exception:
+            pass
+
+    all_predictions = [predictions_by_id[s["decision_point_id"]] for s in samples]
+    _print_prediction_summary(all_predictions)
+    return all_predictions
+
+
+def _print_prediction_summary(all_predictions: List[Dict]) -> None:
+    """Print prediction counts (shared by full run and resume-only path)."""
     prediction_counts = defaultdict(int)
     ground_truth_counts = defaultdict(int)
     none_predictions = 0
     for p in all_predictions:
-        pred = p['prediction']
-        gt = p['ground_truth']
-        prediction_counts[pred if pred else 'None'] += 1
+        pred = p["prediction"]
+        gt = p["ground_truth"]
+        prediction_counts[pred if pred else "None"] += 1
         ground_truth_counts[gt] += 1
         if pred is None:
             none_predictions += 1
     print(f"  Total samples: {len(all_predictions)}")
     print(f"  Predictions: SPEAK={prediction_counts.get('SPEAK', 0)}, SILENT={prediction_counts.get('SILENT', 0)}, None={none_predictions}")
     print(f"  Ground truth: SPEAK={ground_truth_counts.get('SPEAK', 0)}, SILENT={ground_truth_counts.get('SILENT', 0)}")
-    return all_predictions
 
 
 # Model / inference configuration
@@ -239,7 +306,7 @@ SYSTEM_PROMPT = """
         Output SILENT when:
         - The target speaker is a BYSTANDER and the recent utterance is directed at someone else
         - The target speaker has not been referenced, addressed, or involved, and the context does not suggest they are expected to contribute
-        - The recent utterance is clearly incomplete — the speaker is visibly mid-sentence or mid-clause and still formulating their thought
+        - The recent utterance is clearly incomplete - the speaker is visibly mid-sentence or mid-clause and still formulating their thought
         - Someone mentions the target speaker in third person without expecting a response (e.g., "I was telling Speaker X about this earlier")
 
         Output SPEAK when:
@@ -248,16 +315,16 @@ SYSTEM_PROMPT = """
         - The context makes it unambiguous that the speaker is waiting for the target speaker to respond
         - The speaker redirects the conversation to the target speaker (e.g., "What do you think?" in a context where the target speaker was part of the prior exchange)
         - The recent utterance is a general or group-directed question (e.g., "What do we think?", "Anyone disagree?", "Right?", "You know?") and the target speaker is part of the group
-        - The target speaker is an ACTIVE PARTICIPANT and the recent utterance completes a thought, story, opinion, or statement on the topic they have been engaging with — a response (agreement, reaction, follow-up, acknowledgment) is socially expected to maintain natural conversational flow
-        - The target speaker previously asked a question or made a request, and the recent utterance is the answer or response to it — the target speaker is expected to acknowledge or follow up
+        - The target speaker is an ACTIVE PARTICIPANT and the recent utterance completes a thought, story, opinion, or statement on the topic they have been engaging with - a response (agreement, reaction, follow-up, acknowledgment) is socially expected to maintain natural conversational flow
+        - The target speaker previously asked a question or made a request, and the recent utterance is the answer or response to it - the target speaker is expected to acknowledge or follow up
         - The target speaker is an ACTIVE PARTICIPANT and staying silent would unnaturally drop them from the conversation or create an awkward pause
         - The conversation has reached a natural transition point where a brief backchannel or reactive response (e.g., agreement, laughter, "wow", "yeah") from the target speaker would be natural given the content
 
     IMPORTANT NUANCES:
         - The key distinction is ACTIVE PARTICIPANT vs BYSTANDER. Active participants should SPEAK at natural turn boundaries. Bystanders should default to SILENT unless directly addressed.
-        - When uncertain AND the target speaker is a bystander → prefer SILENT
-        - When uncertain AND the target speaker has been actively participating in this exchange → consider whether the most recent utterance is clearly directed at someone else or is a self-contained statement. If so, SILENT is still correct even for active participants.
-        - False interruptions of OTHER PEOPLE'S conversations are bad, but failing to respond when you are part of the conversation is equally bad — it kills the interaction
+        - When uncertain AND the target speaker is a bystander -> prefer SILENT
+        - When uncertain AND the target speaker has been actively participating in this exchange -> consider whether the most recent utterance is clearly directed at someone else or is a self-contained statement. If so, SILENT is still correct even for active participants.
+        - False interruptions of OTHER PEOPLE'S conversations are bad, but failing to respond when you are part of the conversation is equally bad - it kills the interaction
 
     Output your response in this EXACT format:
 
@@ -274,7 +341,7 @@ SYSTEM_PROMPT = """
     Target speaker: Alex
     Speakers: Alex, Sam
     Recent utterance (Sam): "Wait, you actually told her?"
-    <reasoning>Alex is an ACTIVE PARTICIPANT — Sam is directly asking Alex a question. A response is expected.</reasoning>
+    <reasoning>Alex is an ACTIVE PARTICIPANT - Sam is directly asking Alex a question. A response is expected.</reasoning>
     <decision>SPEAK</decision>
     <confidence>high</confidence>
 
@@ -282,7 +349,7 @@ SYSTEM_PROMPT = """
     Target speaker: Jordan
     Speakers: Alex, Jordan, Sam
     Recent utterance (Alex): "Yeah, it was rough. I didn't sleep at all last night."
-    <reasoning>Jordan is a BYSTANDER — Alex is narrating a personal experience to the group. Jordan hasn't been addressed or involved. No response expected.</reasoning>
+    <reasoning>Jordan is a BYSTANDER - Alex is narrating a personal experience to the group. Jordan hasn't been addressed or involved. No response expected.</reasoning>
     <decision>SILENT</decision>
     <confidence>high</confidence>
     """
@@ -762,7 +829,7 @@ def evaluate_samples(
                 if '</decision>' in output_text:
                     decision_end = output_text.find('</decision>')
                     decision_content = output_text[:decision_end].strip()
-                    print(f"Extracted from: '{decision_content}' → {prediction}")
+                    print(f"Extracted from: '{decision_content}' -> {prediction}")
                 print(f"{'='*70}")
             
             context_turns_list = sample.get('context_turns', [])
@@ -857,7 +924,7 @@ def evaluate_samples(
             if '</decision>' in p['output_text']:
                 decision_end = p['output_text'].find('</decision>')
                 decision_content = p['output_text'][:decision_end].strip()
-                print(f"Extracted from: '{decision_content}' → {p['prediction']}")
+                print(f"Extracted from: '{decision_content}' -> {p['prediction']}")
             print(f"{'='*70}")
 
     return all_predictions
@@ -913,8 +980,13 @@ def main(
 
     if is_api_model(model_id):
         print("\nUsing API (no local model load).")
+        checkpoint_file = Path(str(PREDICTIONS_FILE) + ".checkpoint")
         all_predictions = evaluate_samples_api(
-            samples, model_id, debug_prompts=debug_prompts, api_concurrency=api_concurrency
+            samples,
+            model_id,
+            debug_prompts=debug_prompts,
+            api_concurrency=api_concurrency,
+            checkpoint_path=checkpoint_file,
         )
     else:
         print("\nLoading model...")
@@ -939,6 +1011,14 @@ def main(
     with open(PREDICTIONS_FILE, "w") as f:
         json.dump(payload, f, indent=2)
     print("Predictions saved.")
+    if is_api_model(model_id):
+        checkpoint_file = Path(str(PREDICTIONS_FILE) + ".checkpoint")
+        if checkpoint_file.exists():
+            try:
+                checkpoint_file.unlink()
+                print("Checkpoint file removed.")
+            except Exception:
+                pass
 
     metrics = compute_metrics(all_predictions)
     print("\n" + "="*70)

@@ -183,9 +183,10 @@ def setup_model_and_tokenizer(lora_rank=None, use_fsdp=False, local_rank=-1):
 
 
 
-def _make_compute_metrics(tokenizer, eval_predictions_path=None, model_key=None):
+def _make_compute_metrics(tokenizer, eval_predictions_path=None, model_key=None, training_mode: str = "decision_only"):
     import numpy as np
-    use_logit_pos_minus_one = model_key == "gpt-oss-20b"
+    # Causal LM: logits at t predict token at t+1; use pos-1 to get logits that predict the decision token.
+    use_logit_pos_minus_one = (model_key == "gpt-oss-20b") or (model_key == "qwen2.5-7b" and training_mode == "cot")
     speak_ids = tokenizer.encode("SPEAK", add_special_tokens=False)
     silent_ids = tokenizer.encode("SILENT", add_special_tokens=False)
     speak_id = int(speak_ids[1]) if len(speak_ids) >= 2 else (int(speak_ids[-1]) if speak_ids else -1)
@@ -316,9 +317,10 @@ class EvalSummaryCallback(TrainerCallback):
 
 
 class LogTargetVsPredictedCallback(TrainerCallback):
-    def __init__(self, n_samples=4, model_key=None):
+    def __init__(self, n_samples=4, model_key=None, training_mode: str = "decision_only"):
         self.n_samples = n_samples
         self._model_key = model_key
+        self._training_mode = training_mode
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         trainer = getattr(self, "trainer", None)
@@ -373,8 +375,9 @@ class LogTargetVsPredictedCallback(TrainerCallback):
                     else:
                         target_str = "SPEAK" if labels[i, pos].item() == speak_id else "SILENT"
                         if speak_id < V and silent_id < V:
-                            # gpt-oss-20b only: logits at t predict token at t+1
-                            logit_pos = (pos - 1) if (pos >= 1 and getattr(self, "_model_key", None) == "gpt-oss-20b") else pos
+                            # Causal LM: logits at t predict token at t+1. Use pos-1 for gpt-oss-20b or qwen2.5-7b in CoT.
+                            use_minus_one = (self._model_key == "gpt-oss-20b") or (self._model_key == "qwen2.5-7b" and self._training_mode == "cot")
+                            logit_pos = (pos - 1) if (pos >= 1 and use_minus_one) else pos
                             pred_str = "SPEAK" if logits[i, logit_pos, speak_id].item() >= logits[i, logit_pos, silent_id].item() else "SILENT"
                         else:
                             pred_str = "?"
@@ -407,11 +410,12 @@ class LogTargetVsPredictedCallback(TrainerCallback):
 
 
 class TrainerWithBalancedBatches(Trainer):
-    def __init__(self, train_batch_sampler=None, tokenizer=None, model_key=None, **kwargs):
+    def __init__(self, train_batch_sampler=None, tokenizer=None, model_key=None, training_mode: str = "decision_only", **kwargs):
         super().__init__(**kwargs)
         self.train_batch_sampler = train_batch_sampler
         self._tokenizer = tokenizer
-        self._use_logit_pos_minus_one = model_key == "gpt-oss-20b"
+        # Causal LM: logits at t predict token at t+1. Use pos-1 for gpt-oss-20b or qwen2.5-7b in CoT.
+        self._use_logit_pos_minus_one = (model_key == "gpt-oss-20b") or (model_key == "qwen2.5-7b" and training_mode == "cot")
         self._speak_id = None
         self._silent_id = None
         if tokenizer is not None:
@@ -638,8 +642,9 @@ def main(
         tokenizer,
         eval_predictions_path=run_output_dir / "eval_predictions.txt",
         model_key=MODEL,
+        training_mode=training_mode,
     )
-    callbacks = [EvalSummaryCallback(), LogTargetVsPredictedCallback(n_samples=4, model_key=MODEL)]
+    callbacks = [EvalSummaryCallback(), LogTargetVsPredictedCallback(n_samples=4, model_key=MODEL, training_mode=training_mode)]
     if (
         training_config.get("eval_strategy") != "no"
         and not resume_from_checkpoint
@@ -657,6 +662,7 @@ def main(
         train_batch_sampler=train_batch_sampler,
         tokenizer=tokenizer,
         model_key=MODEL,
+        training_mode=training_mode,
         callbacks=callbacks,
     )
     if hasattr(trainer.model, "gradient_checkpointing_disable"):

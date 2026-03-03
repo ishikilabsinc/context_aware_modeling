@@ -214,7 +214,7 @@ def format_category_table(dataset: str, entries: List[Tuple[str, int, Dict]]) ->
 
     # Overall metrics table (same metrics as in baseline_analysis_*.txt)
     lines.append("=" * 120)
-    lines.append(f"OVERALL METRICS — {dataset}")
+    lines.append(f"OVERALL METRICS - {dataset}")
     lines.append("=" * 120)
     lines.append("")
     header = (
@@ -245,12 +245,12 @@ def format_category_table(dataset: str, entries: List[Tuple[str, int, Dict]]) ->
         all_cats.update((acc or {}).keys())
     cols = sorted(all_cats)
     if not cols:
-        lines.append(f"CATEGORY ACCURACY (%) — {dataset}")
+        lines.append(f"CATEGORY ACCURACY (%) - {dataset}")
         lines.append("No category accuracy data.")
         return "\n".join(lines)
     col_width = 8
     lines.append("=" * (model_width + 4 + len(cols) * (col_width + 1)))
-    lines.append(f"CATEGORY ACCURACY (%) — {dataset}")
+    lines.append(f"CATEGORY ACCURACY (%) - {dataset}")
     lines.append("=" * (model_width + 4 + len(cols) * (col_width + 1)))
     lines.append("")
     header2 = f"{'Model':<{model_width}} {'SP':<4} " + " ".join(f"{c:>{col_width}}" for c in cols)

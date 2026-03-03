@@ -103,6 +103,7 @@ python benchmarking/run_benchmark.py --datasets ami spgi --models qwen2.5-7b --s
 
 # Run only the API-based models (no GPU required; set OPENAI_API_KEY and/or GEMINI_API_KEY)
 # API-only runs default to 4 parallel workers (moderate RAM). Use --max-parallel 2 for less RAM.
+# Control concurrent API requests per job with --api-concurrency N (default: 32).
 python benchmarking/run_benchmark.py --models gpt-5.2 gemini-3.1-pro --datasets ami friends --system-prompt-repeats 1 2
 python benchmarking/evaluate_baseline.py --dataset ami --model gpt-5.2 --system-prompt-repeat 1
 python benchmarking/evaluate_baseline.py --dataset friends --model gemini-3.1-pro --system-prompt-repeat 2
@@ -111,7 +112,9 @@ python benchmarking/evaluate_baseline.py --dataset friends --model gemini-3.1-pr
 # No-context samples are excluded by default; use --no-filter-no-context to include them.
 ```
 
-**API models:** For `gpt-5.2` set `OPENAI_API_KEY`; for `gemini-3.1-pro` (Gemini 3.1 Pro) set `GEMINI_API_KEY`. Same prompts and output format as local models; predictions are written to the same `baseline_predictions_<dataset>_<model>_sp<N>.json` files and included in comparison reports.
+**API models:** For `gpt-5.2` set `OPENAI_API_KEY`; for `gemini-3.1-pro` (Gemini 3.1 Pro) set `GEMINI_API_KEY`. Same prompts and output format as local models; predictions are written to the same `baseline_predictions_<dataset>_<model>_sp<N>.json` files and included in comparison reports. Use `--api-concurrency N` to cap concurrent API requests per job (default 32).
+
+**Baseline API checkpoint/resume:** For API-based models (OpenAI, Gemini), each evaluation run saves progress to a `.checkpoint` file every 50 completions. If a run is interrupted or times out, re-run the same command: the script loads the checkpoint, skips already-completed sample IDs, runs the remaining samples, then merges results, writes the final prediction JSON, and removes the checkpoint. No need to pass any extra flags.
 
 For a single (dataset, model, repeat) run, use:
 
@@ -171,6 +174,7 @@ python evaluation/evaluate_finetuned.py --dataset friends --model qwen3-4b-instr
 ```
 
 - **Checkpoint path:** `--mode decision_only` → `fine_tuning/checkpoints/<model>_r<N>/final_model/`; `--mode cot` → `.../<model>_r<N>_cot/final_model/`. For CoT, evaluation parses `<decision>` and saves generated reasoning to `*_reasoning.txt` for review.
+- **Multi-GPU fine-tuned evaluation (gpt-oss-20b + SPGI):** When evaluating `gpt-oss-20b` on the SPGI dataset, `evaluate_finetuned.py` automatically spawns one worker per GPU (up to 8), each evaluating a shard of the test set. Workers write shard result files; the main process merges them by original sample order, recomputes metrics, writes the final results, and deletes the shard files. No extra flags are required; do not use `--shard-index`/`--num-shards` unless you are running the workers manually.
 - Results are written to `evaluation/results/` (e.g. `finetuned_results_friends_qwen3-4b-instruct_r32.json` and `baseline_vs_finetuned_...`). To evaluate a **mid checkpoint** (e.g. `checkpoint-100`), use `--checkpoint checkpoint-100`. Mid checkpoints are loadable when training used the provided FSDP config (`accelerate_fsdp_config.yaml`), which saves each checkpoint in full (FULL_STATE_DICT). Default is `--checkpoint final`.
 
 ---
@@ -211,6 +215,7 @@ All scripts and their main flags are listed below. Defaults and env fallbacks ar
 | `--dataset` | ami | Test dataset: `ami`, `friends`, or `spgi`. |
 | `--model` | MODEL env or qwen3-4b-instruct | Model key (e.g. qwen2.5-7b, qwen3-4b-instruct, mistral-7b-instruct). |
 | `--system-prompt-repeat` | module default | Repeat system prompt: `1` or `2`. |
+| `--api-concurrency` | 32 | Max concurrent API requests when using OpenAI/Gemini. |
 | `--debug-prompts` | off | Print full prompt and input for first few samples. |
 | `--filter-no-context` | on | Exclude samples with no `context_turns` from evaluation. |
 | `--no-filter-no-context` | — | Include samples with no context_turns. |
@@ -220,6 +225,7 @@ All scripts and their main flags are listed below. Defaults and env fallbacks ar
 | `--models` | all | List of model keys to run. |
 | `--system-prompt-repeats` | 1 2 | List of system-prompt repeat values. |
 | `--max-parallel` | min(4, num_gpus) | Max concurrent evaluations (1 GPU each). Use `1` for sequential. |
+| `--api-concurrency` | 32 | Max concurrent API requests per job when using OpenAI/Gemini. |
 | `--filter-no-context` | on | Pass through to each evaluate_baseline run. |
 | `--no-filter-no-context` | — | Include no-context samples in benchmark. |
 
