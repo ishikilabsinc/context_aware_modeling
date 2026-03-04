@@ -25,7 +25,7 @@ DATASET = os.environ.get("DATASET", "ami")
 
 LORA_CONFIG = {
     "r": 32,
-    "lora_alpha": 32,
+    "lora_alpha": 64,
     "lora_dropout": 0.05,
     "target_modules": [
         "q_proj",
