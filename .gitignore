@@ -17,3 +17,7 @@ ami/ami_public_manual_1.6.2/
 __pycache__/
 *.pyc
 
+# JSON, JSONL, and XML data files
+*.json
+*.jsonl
+*.xml

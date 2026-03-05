@@ -31,6 +31,8 @@ import os
 from pathlib import Path
 from typing import Dict
 
+from tqdm import tqdm
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -198,19 +200,16 @@ def main():
     # ========================================================================
     intermediate_samples = []
     
-    for i, sample in enumerate(categorized_samples, start=1):
+    for i, sample in enumerate(tqdm(categorized_samples, desc="Intermediate format", unit=" sample"), start=1):
         intermediate_sample = create_intermediate_sample(sample, i)
         intermediate_samples.append(intermediate_sample)
-        
-        if i % 10000 == 0:
-            print(f"Formatted {i:,}/{len(categorized_samples):,} intermediate samples...")
     
     print("="*70)
     print(f"Generated {len(intermediate_samples):,} intermediate samples")
     
     # Save intermediate JSONL
     with open(INTERMEDIATE_OUTPUT, 'w') as f:
-        for sample in intermediate_samples:
+        for sample in tqdm(intermediate_samples, desc="Writing intermediate", unit=" sample"):
             f.write(json.dumps(sample) + '\n')
     
     print(f"✓ Saved {len(intermediate_samples):,} samples to {INTERMEDIATE_OUTPUT}")
@@ -223,19 +222,16 @@ def main():
     
     training_samples = []
     
-    for i, sample in enumerate(categorized_samples, start=1):
+    for i, sample in enumerate(tqdm(categorized_samples, desc="Training format", unit=" sample"), start=1):
         training_text = create_training_sample(sample)
         training_samples.append(training_text)
-        
-        if i % 10000 == 0:
-            print(f"Formatted {i:,}/{len(categorized_samples):,} training samples...")
     
     print("="*70)
     print(f"Generated {len(training_samples):,} training samples")
     
     # Save training JSONL
     with open(TRAINING_OUTPUT, 'w') as f:
-        for sample_text in training_samples:
+        for sample_text in tqdm(training_samples, desc="Writing training", unit=" sample"):
             # Each line is a JSON object with 'text' field
             f.write(json.dumps({'text': sample_text}) + '\n')
     

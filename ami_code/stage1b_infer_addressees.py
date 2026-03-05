@@ -37,24 +37,34 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import Counter
 
-from config import GEMINI_API_KEY
+from tqdm import tqdm
+from config import (
+    GEMINI_API_KEY,
+    STAGE1B_MODEL_NAME,
+    STAGE1B_CONFIDENCE_THRESHOLD,
+    STAGE1B_MAX_CONTEXT_TURNS,
+    STAGE1B_BATCH_SIZE,
+    STAGE1B_API_DELAY,
+    STAGE1B_STRIDE,
+    STAGE1B_MAX_SAMPLES_PER_MEETING,
+)
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
 except ImportError:
-    print("ERROR: Google AI SDK not installed!")
-    print("Install with: pip install google-generativeai")
+    print("ERROR: Google GenAI SDK not installed!")
+    print("Install with: pip install google-genai")
     exit(1)
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-
 API_KEY = GEMINI_API_KEY  # Defined in config.py
 
 # Root directory of the AMI corpus relative to this repo.
-# This makes the script robust to moving the repository.
+# Points to datasets folder at repo root (one level up from ami_code/)
 AMI_CORPUS_DIR = str(Path(__file__).resolve().parents[1] / 'datasets' / 'ami_public_manual_1.6.2')
 
 # Directory for all intermediate JSON dumps across stages
@@ -65,19 +75,12 @@ EXPLICIT_SEQUENCES_FILE = JSON_DUMPS_DIR / 'stage1_sequences.json'
 OUTPUT_FILE = JSON_DUMPS_DIR / 'stage1b_inferred_sequences.json'
 COMBINED_OUTPUT = JSON_DUMPS_DIR / 'stage1_combined_sequences.json'
 
-# Model configuration
-# Common working names: 'gemini-pro', 'gemini-1.5-flash', 'gemini-1.5-pro'
-# Run test_available_models.py to see which models work with your API key
-MODEL_NAME = 'gemini-flash-latest'  # Most widely available and stable
-
-# Inference parameters
-CONFIDENCE_THRESHOLD = 6  # Only use predictions with confidence >= 6/10
-                          # Lower = more data but lower quality
-                          # Higher = less data but higher quality
-                          # Recommended: 5-7 for balanced results
-MAX_CONTEXT_TURNS = 10  # Number of previous turns to include in prompt
-BATCH_SIZE = 10  # Process 10 turns before API call delay
-API_DELAY = 1.0  # Seconds to wait between batches (rate limiting)
+# Model and inference parameters (imported from config.py, can be overridden by CLI args)
+MODEL_NAME = STAGE1B_MODEL_NAME
+CONFIDENCE_THRESHOLD = STAGE1B_CONFIDENCE_THRESHOLD
+MAX_CONTEXT_TURNS = STAGE1B_MAX_CONTEXT_TURNS
+BATCH_SIZE = STAGE1B_BATCH_SIZE
+API_DELAY = STAGE1B_API_DELAY
 
 # ============================================================================
 # GEMINI SETUP (API KEY METHOD)
@@ -85,13 +88,13 @@ API_DELAY = 1.0  # Seconds to wait between batches (rate limiting)
 
 def init_gemini(api_key: str):
     """
-    Initialize Gemini with API key
-    
+    Initialize Gemini client and generation config (google.genai).
+
     Args:
         api_key: Google AI Studio API key
-        
+
     Returns:
-        GenerativeModel instance
+        (client, generation_config) for use with client.models.generate_content
     """
     if not api_key or api_key == 'YOUR_API_KEY_HERE':
         print("\n" + "="*70)
@@ -107,24 +110,22 @@ def init_gemini(api_key: str):
         print("   export GEMINI_API_KEY='AIza...'")
         print("="*70 + "\n")
         exit(1)
-    
+
     print(f"Initializing Gemini API...")
     print(f"  Model: {MODEL_NAME}")
-    
-    genai.configure(api_key=api_key)
-    
-    # Configure model for structured output
-    generation_config = {
-        'temperature': 0.0,  # Low temperature for consistent output
-        'top_p': 0.8,
-        'top_k': 20,
-        'max_output_tokens': 500,  # Enough for addressees + confidence + reasoning
-    }
-    
-    model = genai.GenerativeModel(MODEL_NAME)
+
+    client = genai.Client(api_key=api_key)
+
+    generation_config = types.GenerateContentConfig(
+        temperature=0.0,
+        top_p=0.8,
+        top_k=20,
+        max_output_tokens=500,
+    )
+
     print("✓ Gemini model initialized")
-    
-    return model, generation_config
+
+    return client, generation_config
 
 
 # ============================================================================
@@ -387,7 +388,7 @@ def get_meeting_speakers(corpus_dir: str, meeting_id: str) -> List[str]:
 
 def infer_sequences_with_gemini(corpus_dir: str,
                                 meeting_ids: List[str],
-                                model,
+                                client,
                                 generation_config,
                                 max_turns_per_meeting: Optional[int] = None,
                                 stride: int = 1,
@@ -404,21 +405,16 @@ def infer_sequences_with_gemini(corpus_dir: str,
     sequences = []
     total_api_calls = 0
     
-    for meeting_id, all_dacts in meeting_dacts.items():
-        print(f"\nProcessing {meeting_id} with Gemini inference...")
+    for meeting_id, all_dacts in tqdm(meeting_dacts.items(), desc="Gemini inference", unit="meeting"):
         meeting_speakers = get_meeting_speakers(corpus_dir, meeting_id)
-        print(f"  Speakers: {', '.join(meeting_speakers)}")
         
         # Limit turns if specified (for testing)
         if max_turns_per_meeting:
             all_dacts = all_dacts[:max_turns_per_meeting]
-            print(f"  Limited to first {len(all_dacts)} dialogue acts (test mode)")
-        else:
-            print(f"  Un-annotated dialogue acts: {len(all_dacts)}")
         
         batch_count = 0
         
-        for i, dact in enumerate(all_dacts):
+        for i, dact in enumerate(tqdm(all_dacts, desc=meeting_id, leave=False, unit="dact")):
             # Get context
             context_start = max(0, i - MAX_CONTEXT_TURNS)
             context = all_dacts[context_start:i]
@@ -435,33 +431,18 @@ def infer_sequences_with_gemini(corpus_dir: str,
             )
             
             try:
-                # Call Gemini API
-                response = model.generate_content(
-                    prompt,
-                    generation_config=generation_config
+                # Call Gemini API (google.genai)
+                response = client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=prompt,
+                    config=generation_config,
                 )
-                
+
                 total_api_calls += 1
-                
-                # Check if response has valid content
-                if not response.candidates:
-                    # No candidates returned (likely blocked or empty)
+
+                response_text = getattr(response, 'text', None)
+                if not response_text or not response_text.strip():
                     continue
-                
-                candidate = response.candidates[0]
-                
-                # Check finish reason
-                # 1=STOP (normal), 2=MAX_TOKENS, 3=SAFETY, 4=RECITATION, 5=OTHER
-                if candidate.finish_reason not in [1, 'STOP']:
-                    # Response was blocked or incomplete
-                    # This is normal - just skip this turn
-                    continue
-                
-                # Check if there's actual text content
-                if not candidate.content.parts:
-                    continue
-                
-                response_text = candidate.content.parts[0].text
                 
                 # Parse response
                 addressees, confidence, reason = parse_gemini_response(
@@ -691,13 +672,14 @@ Examples:
     parser.add_argument(
         '--stride',
         type=int,
-        default=1,
-        help='Take every Nth high-quality dialogue act per meeting before Gemini (default: 1 = use all)'
+        default=STAGE1B_STRIDE,
+        help=f'Take every Nth high-quality dialogue act per meeting before Gemini (default: {STAGE1B_STRIDE} = use all from config)'
     )
     parser.add_argument(
         '--max-samples-per-meeting',
         type=int,
-        help='Optional cap on number of high-quality dialogue acts per meeting passed to Gemini'
+        default=None,  # None means use config value
+        help=f'Optional cap on number of high-quality dialogue acts per meeting passed to Gemini (default: {STAGE1B_MAX_SAMPLES_PER_MEETING} from config.py)'
     )
     
     args = parser.parse_args()
@@ -728,22 +710,26 @@ Examples:
         meeting_ids = all_meeting_ids
         print(f"✓ Found {len(meeting_ids)} meetings: {', '.join(meeting_ids)}")
     
+    # Use CLI args if provided, otherwise use config defaults
+    stride = args.stride
+    max_samples_per_meeting = args.max_samples_per_meeting if args.max_samples_per_meeting is not None else STAGE1B_MAX_SAMPLES_PER_MEETING
+    
     # Show test mode info
     if args.max_turns:
         print(f"✓ Test mode: Processing max {args.max_turns} turns per meeting")
-    if args.stride and args.stride > 1:
-        print(f"✓ Stride sampling: taking every {args.stride}th high-quality dialogue act per meeting")
-    if args.max_samples_per_meeting:
-        print(f"✓ Capping to max {args.max_samples_per_meeting} high-quality dialogue acts per meeting")
+    if stride > 1:
+        print(f"✓ Stride sampling: taking every {stride}th high-quality dialogue act per meeting")
+    if max_samples_per_meeting:
+        print(f"✓ Capping to max {max_samples_per_meeting} high-quality dialogue acts per meeting")
     
     # Initialize Gemini
     try:
-        model, generation_config = init_gemini(API_KEY)
+        client, generation_config = init_gemini(API_KEY)
     except Exception as e:
         print(f"\nERROR: Failed to initialize Gemini API")
         print(f"  {e}")
         return
-    
+
     # Infer addressees
     print("\n" + "="*70)
     print("INFERRING ADDRESSEES WITH GEMINI")
@@ -752,15 +738,15 @@ Examples:
     print(f"Batch size: {BATCH_SIZE} (with {API_DELAY}s delay)")
     print(f"Max context turns: {MAX_CONTEXT_TURNS}")
     print()
-    
+
     inferred_sequences = infer_sequences_with_gemini(
         AMI_CORPUS_DIR,
         meeting_ids,
-        model,
+        client,
         generation_config,
         max_turns_per_meeting=args.max_turns,
-        stride=args.stride,
-        max_samples_per_meeting=args.max_samples_per_meeting,
+        stride=stride,
+        max_samples_per_meeting=max_samples_per_meeting,
     )
     
     print(f"\n✓ Generated {len(inferred_sequences):,} inferred sequences")
@@ -775,7 +761,9 @@ Examples:
     with open(COMBINED_OUTPUT, 'w') as f:
         json.dump(combined_sequences, f, indent=2)
     print(f"✓ Saved combined sequences to {COMBINED_OUTPUT}")
-    
+
+    client.close()
+
     # Statistics
     print_statistics(explicit_sequences, inferred_sequences)
     print_examples(inferred_sequences)

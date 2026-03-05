@@ -6,7 +6,7 @@ Goal:
     Filter stage4 output for high-quality, balanced training data:
     - Remove filler words and low-quality utterances
     - Balance SPEAK/SILENT ratio (50/50)
-    - Balance subcategories (I1-I3, S1-S5) to avoid skew
+    - Balance subcategories (4 categories) to avoid skew
     - Sort by confidence and select best samples
 
 Input:
@@ -23,6 +23,23 @@ from pathlib import Path
 from typing import List, Dict, Set
 from collections import Counter, defaultdict
 
+from tqdm import tqdm
+from config import (
+    STAGE4_SPEAK_RATIO,
+    STAGE4_MIN_TEXT_LENGTH,
+    STAGE4_MAX_SAMPLES,
+    STAGE4_MAX_CATEGORY_RATIO,
+    STAGE4_ENABLE_DEDUPLICATION,
+    STAGE4_DEDUP_NGRAM_N,
+    STAGE4_DEDUP_SIMILARITY_THRESHOLD,
+    STAGE4_DEDUP_SAME_MEETING_ONLY,
+    STAGE4_DEDUP_CONTEXT_WINDOW,
+    STAGE4_REMOVE_NO_CONTEXT,
+    STAGE4_REMOVE_SHORT_QUERY,
+    STAGE4_MIN_QUERY_WORDS,
+    STAGE4_GEMINI_CONFIDENCE_FILTER,
+)
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -37,9 +54,6 @@ JSON_RUN_DIR = Path('json_run')
 OUTPUT_DIR = 'data_final'
 OUTPUT_FILE = 'stage4_filtered_samples.jsonl'  # JSONL format
 
-# Target ratio for SPEAK/SILENT
-SPEAK_RATIO = 0.5  # 50% SPEAK, 50% SILENT
-
 # Filler words/patterns to remove (case-insensitive)
 FILLER_PATTERNS = [
     r'^\s*mm+\s*[-.]?\s*hm+\s*\.?\s*$',  # Mm-hmm, Mmhmm, etc.
@@ -52,16 +66,6 @@ FILLER_PATTERNS = [
     r'^\s*hm+\s*\.?\s*$',                  # Hmm
     r'^\s*\.\s*$',                         # Just punctuation
 ]
-
-# Minimum text length (characters) after cleaning
-MIN_TEXT_LENGTH = 3
-
-# Maximum samples to keep (None = keep all that pass filters)
-MAX_SAMPLES = None  # Can be set to limit dataset size, e.g., 1000000
-
-# Subcategory balance threshold (max ratio any category can be)
-# E.g., 0.4 means no category can be more than 40% of its class
-MAX_CATEGORY_RATIO = 0.35
 
 # ============================================================================
 # CONFIDENCE SCORING
@@ -137,7 +141,7 @@ def is_low_quality(sample: Dict) -> bool:
     
     # Too short (after removing punctuation and whitespace)
     text_alphanum = re.sub(r'[^\w\s]', '', text)
-    if len(text_alphanum.strip()) < MIN_TEXT_LENGTH:
+    if len(text_alphanum.strip()) < STAGE4_MIN_TEXT_LENGTH:
         return True
     
     # Mostly punctuation (>50% non-alphanumeric)
@@ -204,8 +208,38 @@ def create_sample_signature(sample: Dict, context_window: int = 3) -> str:
     
     # Create composite signature
     signature = f"{current_text}:::{context_str}:::{decision}"
-    
+
     return signature
+
+
+def get_word_ngrams(text: str, n: int) -> Set[tuple]:
+    """Word-level n-grams from normalized text (hashable tuples)."""
+    norm = normalize_text(text)
+    words = norm.split()
+    if len(words) < n:
+        return set((tuple(words),)) if words else set()
+    return set(tuple(words[i : i + n]) for i in range(len(words) - n + 1))
+
+
+def sample_to_ngram_set(sample: Dict, context_window: int, n: int) -> Set[tuple]:
+    """N-grams from last context_window context turns + current turn (for similarity)."""
+    parts = []
+    context_turns = sample.get('context_turns', [])
+    recent = context_turns[-context_window:] if len(context_turns) > context_window else context_turns
+    for t in recent:
+        parts.append(normalize_text(t['text']))
+    parts.append(normalize_text(sample['current_turn']['text']))
+    combined = " ".join(parts)
+    return get_word_ngrams(combined, n)
+
+
+def jaccard_similarity(a: Set[tuple], b: Set[tuple]) -> float:
+    """Jaccard similarity between two n-gram sets; 0 if both empty."""
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
 
 
 def deduplicate_samples(samples: List[Dict]) -> List[Dict]:
@@ -231,8 +265,12 @@ def deduplicate_samples(samples: List[Dict]) -> List[Dict]:
     if not samples:
         return []
     
+    context_window = min(5, STAGE4_DEDUP_CONTEXT_WINDOW)  # last 5 context + current only
+    n = STAGE4_DEDUP_NGRAM_N
+    thresh = STAGE4_DEDUP_SIMILARITY_THRESHOLD
+    same_meeting_only = STAGE4_DEDUP_SAME_MEETING_ONLY
+    
     print(f"\n  Starting samples: {len(samples):,}")
-    print(f"  Deduplication strategy: Text + Context (last 3 turns) + Label")
     
     # Sort by confidence (high to low) to keep better samples
     samples_sorted = sorted(
@@ -241,29 +279,84 @@ def deduplicate_samples(samples: List[Dict]) -> List[Dict]:
         reverse=True
     )
     
-    # Track seen signatures
-    seen_signatures: Set[str] = set()
+    def _meeting_key(sample: Dict) -> str:
+        return str(sample.get('meeting_id', ''))
     
-    deduplicated = []
-    duplicates_removed = 0
+    if thresh >= 1.0:
+        print(f"  Deduplication strategy: Exact (text + context + label)")
+        seen_signatures: Set[str] = set()
+        deduplicated = []
+        duplicates_removed = 0
+        for sample in samples_sorted:
+            signature = create_sample_signature(sample)
+            if signature in seen_signatures:
+                duplicates_removed += 1
+                continue
+            seen_signatures.add(signature)
+            deduplicated.append(sample)
+        print(f"  Removed {duplicates_removed:,} duplicates")
+    else:
+        scope = "same meeting" if same_meeting_only else "global"
+        print(f"  Deduplication strategy: N-gram (n={n}, Jaccard>={thresh}, {scope}, last {context_window} ctx + current)")
+        deduplicated = []
+        kept_ngrams: Dict[tuple, List[Set[tuple]]] = defaultdict(list)
+        duplicates_removed = 0
+        for sample in samples_sorted:
+            ngrams = sample_to_ngram_set(sample, context_window, n)
+            decision = sample['decision']
+            key = (_meeting_key(sample), decision) if same_meeting_only else (decision,)
+            if any(jaccard_similarity(ngrams, k) >= thresh for k in kept_ngrams[key]):
+                duplicates_removed += 1
+                continue
+            kept_ngrams[key].append(ngrams)
+            deduplicated.append(sample)
+        print(f"  Removed {duplicates_removed:,} near-duplicates (similar context+turn)")
     
-    for sample in samples_sorted:
-        # Create unique signature
-        signature = create_sample_signature(sample)
-        
-        # Check if we've seen this exact combination before
-        if signature in seen_signatures:
-            duplicates_removed += 1
-            continue
-        
-        # Keep this sample
-        seen_signatures.add(signature)
-        deduplicated.append(sample)
-    
-    print(f"  Removed {duplicates_removed:,} duplicates (same text + context + label)")
     print(f"  Remaining samples: {len(deduplicated):,}")
     
     return deduplicated
+
+
+# ============================================================================
+# ADDITIONAL FILTER HELPERS (Stage 4 configurable filters)
+# ============================================================================
+
+def has_context(sample: Dict) -> bool:
+    """
+    Check if sample has any context turns
+    """
+    context_turns = sample.get('context_turns', [])
+    return bool(context_turns)
+
+
+def is_short_query(sample: Dict) -> bool:
+    """
+    Check if the current turn is a short query/utterance based on word count
+    """
+    text = sample['current_turn']['text']
+    # Count alphanumeric word tokens
+    words = re.findall(r'\w+', text)
+    return len(words) < STAGE4_MIN_QUERY_WORDS
+
+
+# ============================================================================
+# FILTER FIELDS FOR DOWNSTREAM FILTERING FROM JSONL
+# ============================================================================
+
+def add_filter_fields(sample: Dict) -> Dict:
+    """
+    Add fields to each sample so consumers can filter from the JSONL without
+    re-running Stage 4. Filter by: num_context_turns >= 1, num_query_words >= N, etc.
+    """
+    text = sample.get('current_turn', {}).get('text', '') or ''
+    context_turns = sample.get('context_turns', [])
+    words = re.findall(r'\w+', text)
+    out = dict(sample)
+    out['num_context_turns'] = len(context_turns)
+    out['num_query_words'] = len(words)
+    out['current_turn_text_length'] = len(text.strip())
+    out['is_filler'] = is_filler_text(text)
+    return out
 
 
 # ============================================================================
@@ -272,9 +365,9 @@ def deduplicate_samples(samples: List[Dict]) -> List[Dict]:
 
 def balance_by_category(samples: List[Dict], 
                        target_count: int,
-                       max_category_ratio: float = MAX_CATEGORY_RATIO) -> List[Dict]:
+                       max_category_ratio: float = STAGE4_MAX_CATEGORY_RATIO) -> List[Dict]:
     """
-    Balance samples by category (I1-I3 or S1-S5) to avoid skew
+    Balance samples by category (4 categories) to avoid skew
     
     Strategy:
     1. Sort by confidence score
@@ -358,7 +451,7 @@ def balance_by_category(samples: List[Dict],
 
 
 def balance_speak_silent(samples: List[Dict], 
-                        speak_ratio: float = SPEAK_RATIO) -> List[Dict]:
+                        speak_ratio: float = STAGE4_SPEAK_RATIO) -> List[Dict]:
     """
     Balance SPEAK and SILENT samples
     
@@ -378,8 +471,8 @@ def balance_speak_silent(samples: List[Dict],
     # Determine target counts
     total_available = len(speak_samples) + len(silent_samples)
     
-    if MAX_SAMPLES and total_available > MAX_SAMPLES:
-        total_target = MAX_SAMPLES
+    if STAGE4_MAX_SAMPLES and total_available > STAGE4_MAX_SAMPLES:
+        total_target = STAGE4_MAX_SAMPLES
     else:
         # Balance to the minority class to avoid throwing away too much data
         minority_count = min(len(speak_samples), len(silent_samples))
@@ -395,10 +488,10 @@ def balance_speak_silent(samples: List[Dict],
     print(f"  Target: {speak_target:,} SPEAK, {silent_target:,} SILENT")
     
     # Balance each class by subcategories
-    print(f"\n  Balancing SPEAK categories (I1-I3)...")
+    print(f"\n  Balancing SPEAK categories (SPEAK_explicit, SPEAK_implicit)...")
     balanced_speak = balance_by_category(speak_samples, speak_target)
     
-    print(f"  Balancing SILENT categories (S1-S5)...")
+    print(f"  Balancing SILENT categories (SILENT_no_ref, SILENT_ref)...")
     balanced_silent = balance_by_category(silent_samples, silent_target)
     
     # Combine
@@ -433,8 +526,8 @@ def print_statistics(samples: List[Dict], title: str = "Dataset Statistics"):
     categories = Counter(s['category'] for s in samples)
     print(f"\nCategory distribution:")
     
-    # SPEAK categories (I1-I3)
-    speak_cats = {k: v for k, v in categories.items() if k.startswith('I')}
+    # SPEAK categories
+    speak_cats = {k: v for k, v in categories.items() if k.startswith('SPEAK_')}
     if speak_cats:
         speak_total = sum(speak_cats.values())
         print(f"\n  SPEAK categories ({speak_total:,} total):")
@@ -443,8 +536,8 @@ def print_statistics(samples: List[Dict], title: str = "Dataset Statistics"):
             pct = count / speak_total * 100
             print(f"    {cat}: {count:,} ({pct:.1f}%)")
     
-    # SILENT categories (S1-S5)
-    silent_cats = {k: v for k, v in categories.items() if k.startswith('S')}
+    # SILENT categories
+    silent_cats = {k: v for k, v in categories.items() if k.startswith('SILENT_')}
     if silent_cats:
         silent_total = sum(silent_cats.values())
         print(f"\n  SILENT categories ({silent_total:,} total):")
@@ -514,30 +607,62 @@ def main():
     print("="*70)
     
     filtered_samples = []
-    filtered_out_count = 0
+    filtered_out_low_quality = 0
     
-    for sample in all_samples:
+    for sample in tqdm(all_samples, desc="Quality filter", unit=" sample"):
         if not is_low_quality(sample):
             filtered_samples.append(sample)
         else:
-            filtered_out_count += 1
+            filtered_out_low_quality += 1
     
-    print(f"\n✓ Filtered out {filtered_out_count:,} low-quality samples")
-    print(f"✓ Remaining: {len(filtered_samples):,} samples")
-    
-    # Deduplicate samples
+    print(f"\n✓ Filtered out {filtered_out_low_quality:,} low-quality samples")
+    print(f"✓ Remaining after quality filter: {len(filtered_samples):,} samples")
+
+    # Optional configurable filters (no-context and short-query are now in output as fields;
+    # filter from JSONL using num_context_turns and num_query_words)
     print("\n" + "="*70)
-    print("REMOVING EXACT DUPLICATES")
+    print("CONFIGURABLE FILTERS (optional; filter from JSONL using output fields)")
     print("="*70)
-    
-    deduplicated_samples = deduplicate_samples(filtered_samples)
+
+    advanced_filtered_samples = []
+    filtered_gemini_conf = 0
+
+    for sample in tqdm(filtered_samples, desc="Applying filters", unit=" sample"):
+        # Optional: remove samples with no context (else filter from JSONL: num_context_turns >= 1)
+        if STAGE4_REMOVE_NO_CONTEXT and not has_context(sample):
+            continue
+        # Optional: remove short queries (else filter from JSONL: num_query_words >= STAGE4_MIN_QUERY_WORDS)
+        if STAGE4_REMOVE_SHORT_QUERY and is_short_query(sample):
+            continue
+
+        # Additional Gemini confidence-based filtering (only for AI-inferred samples)
+        if STAGE4_GEMINI_CONFIDENCE_FILTER is not None:
+            if sample.get('source') == 'gemini_inferred':
+                if sample.get('inference_confidence', 0) < STAGE4_GEMINI_CONFIDENCE_FILTER:
+                    filtered_gemini_conf += 1
+                    continue
+
+        advanced_filtered_samples.append(sample)
+
+    print(f"\n✓ Remaining after configurable filters: {len(advanced_filtered_samples):,} samples")
+    if STAGE4_GEMINI_CONFIDENCE_FILTER is not None:
+        print(f"  - Removed {filtered_gemini_conf:,} AI-inferred samples below Gemini confidence {STAGE4_GEMINI_CONFIDENCE_FILTER}/10")
+    print("  - Output includes num_context_turns, num_query_words, current_turn_text_length, is_filler for filtering from JSONL")
+
+    # Deduplicate samples (configurable)
+    deduplicated_samples = advanced_filtered_samples
+    if STAGE4_ENABLE_DEDUPLICATION:
+        print("\n" + "="*70)
+        print("REMOVING EXACT DUPLICATES")
+        print("="*70)
+        deduplicated_samples = deduplicate_samples(advanced_filtered_samples)
     
     # Balance SPEAK/SILENT and subcategories
     print("\n" + "="*70)
     print("BALANCING SPEAK/SILENT AND SUBCATEGORIES")
     print("="*70)
     
-    balanced_samples = balance_speak_silent(deduplicated_samples, speak_ratio=SPEAK_RATIO)
+    balanced_samples = balance_speak_silent(deduplicated_samples, speak_ratio=STAGE4_SPEAK_RATIO)
     
     # Print final statistics
     print_statistics(balanced_samples, "AFTER FILTERING, DEDUPLICATION, AND BALANCING")
@@ -563,17 +688,17 @@ def main():
     print(f"\nSaving filtered samples to {output_path}...")
     
     with open(output_path, 'w') as f:
-        for sample in balanced_samples:
-            f.write(json.dumps(sample) + '\n')
+        for sample in tqdm(balanced_samples, desc="Writing JSONL", unit=" sample"):
+            f.write(json.dumps(add_filter_fields(sample)) + '\n')
     
-    print(f"✓ Saved {len(balanced_samples):,} samples in JSONL format")
+    print(f"✓ Saved {len(balanced_samples):,} samples in JSONL format (with num_context_turns, num_query_words, etc.)")
 
     # Also save each filtered sample as an individual JSON file in JSON_RUN_DIR
     print(f"\nSaving individual filtered samples to {JSON_RUN_DIR}/ ...")
-    for idx, sample in enumerate(balanced_samples, start=1):
+    for idx, sample in enumerate(tqdm(balanced_samples, desc="Writing json_run", unit=" file"), start=1):
         sample_path = JSON_RUN_DIR / f"{idx}.json"
         with open(sample_path, 'w') as sf:
-            json.dump(sample, sf, indent=2)
+            json.dump(add_filter_fields(sample), sf, indent=2)
     print(f"✓ Saved {len(balanced_samples):,} individual sample files")
     
     # Save summary statistics
@@ -585,10 +710,23 @@ def main():
         'category_distribution': dict(Counter(s['category'] for s in balanced_samples)),
         'confidence_distribution': dict(Counter(s['confidence'] for s in balanced_samples)),
         'filtering_config': {
-            'speak_ratio': SPEAK_RATIO,
-            'max_category_ratio': MAX_CATEGORY_RATIO,
-            'min_text_length': MIN_TEXT_LENGTH,
-            'deduplication': 'text + context (3 turns) + label'
+            'speak_ratio': STAGE4_SPEAK_RATIO,
+            'max_category_ratio': STAGE4_MAX_CATEGORY_RATIO,
+            'min_text_length': STAGE4_MIN_TEXT_LENGTH,
+            'deduplication_enabled': STAGE4_ENABLE_DEDUPLICATION,
+            'remove_no_context': STAGE4_REMOVE_NO_CONTEXT,
+            'remove_short_query': STAGE4_REMOVE_SHORT_QUERY,
+            'min_query_words': STAGE4_MIN_QUERY_WORDS,
+            'gemini_confidence_filter': STAGE4_GEMINI_CONFIDENCE_FILTER,
+            'deduplication_strategy': 'text + context (3 turns) + label'
+        },
+        'filter_from_jsonl': {
+            'num_context_turns': 'Filter rows with num_context_turns >= 1 to require context',
+            'num_query_words': f'Filter rows with num_query_words >= N (e.g. {STAGE4_MIN_QUERY_WORDS}) to drop short queries',
+            'current_turn_text_length': 'Filter by min character length',
+            'is_filler': 'Filter out rows with is_filler true',
+            'source': "Filter by origin: 'gemini_inferred' (AI-inferred addressee) or 'explicit' (annotated). Keep only one if desired.",
+            'inference_confidence': "For source=='gemini_inferred', filter with inference_confidence >= N (0-10). E.g. >= 6 keeps higher-confidence Gemini samples."
         }
     }
     

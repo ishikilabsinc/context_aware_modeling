@@ -37,14 +37,10 @@ STATS_OUTPUT = 'data_statistics.json'
 EXAMPLES_OUTPUT = 'sample_examples.txt'
 
 CATEGORY_NAMES = {
-    'I1': 'SPEAK - Direct address',
-    'I2': 'SPEAK - Context follow-up',
-    'I3': 'SPEAK - Implicit redirect',
-    'S1': 'SILENT - No reference',
-    'S2': 'SILENT - Mentioned but not addressed',
-    'S3': 'SILENT - Context shifted away',
-    'S4': 'SILENT - Incomplete sentence',
-    'S5': 'SILENT - Explicit context switch'
+    'SPEAK_explicit': 'Target was directly addressed',
+    'SPEAK_implicit': 'Target spoke but not from direct address',
+    'SILENT_no_ref': 'No reference to target',
+    'SILENT_ref': 'Target mentioned or in context, but did not speak',
 }
 
 # ============================================================================
@@ -110,14 +106,7 @@ def print_category_distribution(samples: List[Dict]):
     categories = [s['category'] for s in samples]
     category_counts = Counter(categories)
     
-    print("\nSPEAK Categories (I1-I3):")
-    for cat in ['I1', 'I2', 'I3']:
-        count = category_counts.get(cat, 0)
-        percentage = count / total_samples * 100
-        print(f"  {cat} - {CATEGORY_NAMES[cat]}: {count:,} ({percentage:.1f}%)")
-    
-    print("\nSILENT Categories (S1-S5):")
-    for cat in ['S1', 'S2', 'S3', 'S4', 'S5']:
+    for cat in ['SPEAK_explicit', 'SPEAK_implicit', 'SILENT_no_ref', 'SILENT_ref']:
         count = category_counts.get(cat, 0)
         percentage = count / total_samples * 100
         print(f"  {cat} - {CATEGORY_NAMES[cat]}: {count:,} ({percentage:.1f}%)")
@@ -223,7 +212,7 @@ def generate_example_samples(samples: List[Dict], examples_per_category: int = 5
     
     category_examples = {}
     
-    for cat in ['I1', 'I2', 'I3', 'S1', 'S2', 'S3', 'S4', 'S5']:
+    for cat in ['SPEAK_explicit', 'SPEAK_implicit', 'SILENT_no_ref', 'SILENT_ref']:
         cat_samples = [s for s in samples if s['category'] == cat]
         if cat_samples:
             # Randomly sample
@@ -244,7 +233,7 @@ def save_example_samples(category_examples: Dict, filename: str):
         f.write("TRAINING DATASET EXAMPLE SAMPLES\n")
         f.write("="*70 + "\n\n")
         
-        for cat in ['I1', 'I2', 'I3', 'S1', 'S2', 'S3', 'S4', 'S5']:
+        for cat in ['SPEAK_explicit', 'SPEAK_implicit', 'SILENT_no_ref', 'SILENT_ref']:
             f.write(f"\n{'='*70}\n")
             f.write(f"{cat}: {CATEGORY_NAMES[cat]}\n")
             f.write(f"{'='*70}\n\n")
@@ -325,7 +314,7 @@ def compile_statistics(samples: List[Dict]) -> Dict:
                 'percentage': category_counts.get(cat, 0) / total_samples * 100,
                 'name': CATEGORY_NAMES[cat]
             }
-            for cat in ['I1', 'I2', 'I3', 'S1', 'S2', 'S3', 'S4', 'S5']
+            for cat in ['SPEAK_explicit', 'SPEAK_implicit', 'SILENT_no_ref', 'SILENT_ref']
         },
         'confidence_distribution': {
             'overall': {
@@ -413,7 +402,7 @@ def main():
     decision_counts = Counter(decisions)
     print(f"  SPEAK: {decision_counts['SPEAK']:,} ({decision_counts['SPEAK']/len(samples)*100:.1f}%)")
     print(f"  SILENT: {decision_counts['SILENT']:,} ({decision_counts['SILENT']/len(samples)*100:.1f}%)")
-    print(f"  Categories: I1-I3 (SPEAK), S1-S5 (SILENT)")
+    print(f"  Categories: SPEAK_explicit, SPEAK_implicit, SILENT_no_ref, SILENT_ref")
     unique_meetings = set(s['meeting_id'] for s in samples)
     all_speakers = set()
     for s in samples:

@@ -23,12 +23,15 @@ import re
 from typing import List, Dict, Optional
 from collections import Counter
 
+from tqdm import tqdm
+from config import STAGE1_MAX_CONTEXT_TURNS, STAGE1_MAX_MEETINGS
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
 # Root directory of the AMI corpus relative to this repo.
-# This makes the script robust to moving the repository.
+# Points to datasets folder at repo root (one level up from ami_code/)
 AMI_CORPUS_DIR = str(Path(__file__).resolve().parents[1] / 'datasets' / 'ami_public_manual_1.6.2')
 
 # Directory for all intermediate JSON dumps across stages
@@ -239,14 +242,14 @@ def extract_conversation_sequences_ami(corpus_dir: str, meeting_ids: List[str] =
                 # Only include meetings with addressee annotations
                 if tree.findall('.//dact[@addressee]', ns):
                     meeting_ids.append(meeting_id)
-        meeting_ids = sorted(set(meeting_ids))[:10]  # Limit to first 10 meetings
+        meeting_ids = sorted(set(meeting_ids))
+        if STAGE1_MAX_MEETINGS is not None:
+            meeting_ids = meeting_ids[:STAGE1_MAX_MEETINGS]
         print(f"Auto-discovered {len(meeting_ids)} meetings with addressee annotations")
     
     sequences = []
     
-    for meeting_id in meeting_ids:
-        print(f"Processing {meeting_id}...")
-        
+    for meeting_id in tqdm(meeting_ids, desc="Extracting dialogues", unit="meeting"):
         # Collect all dialogue acts for this meeting
         all_dacts = []
         
@@ -285,8 +288,8 @@ def extract_conversation_sequences_ami(corpus_dir: str, meeting_ids: List[str] =
                 addressees = dact['addressee']
                 addressing_speaker = dact['speaker']
                 
-                # Get context (up to 10 turns before for better context understanding)
-                context = all_dacts[max(0, i-10):i]
+                # Get context (up to STAGE1_MAX_CONTEXT_TURNS turns before for better context understanding)
+                context = all_dacts[max(0, i-STAGE1_MAX_CONTEXT_TURNS):i]
                 
                 # Find response from one of the addressees (within next 20 turns)
                 response = None

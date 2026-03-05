@@ -6,25 +6,13 @@ Goal:
     For each decision point:
     1. Assign label: SPEAK or SILENT based on ground truth (target_spoke_next)
     2. Assign confidence level (high/medium/low)
-    3. Assign fine-grained category (I1-I3 for SPEAK, S1-S5 for SILENT)
-    
-    SPEAK Categories (I1-I3):
-        - I1: Direct address with explicit naming
-        - I2: Context follow-up (continuation of dialogue)
-        - I3: Implicit redirect (logical respondent)
-    
-    SILENT Categories (S1-S5):
-        - S1: No reference to target
-        - S2: Target mentioned but not addressed
-        - S3: Target was in prior exchange but context shifted
-        - S4: Incomplete sentence
-        - S5: Explicit context switch to different speaker
+    3. Assign category (4 total: SPEAK_explicit, SPEAK_implicit, SILENT_no_ref, SILENT_ref)
 
 Input:
     - json_dumps/stage2_decision_points.json from Stage 2
 
 Output:
-    - json_dumps/stage4_categorized_samples.json - labeled and categorized samples for Stage 4.5
+    - json_dumps/stage3_categorized_samples.json - labeled and categorized samples for Stage 4
 
 Labeling Logic:
     Uses ground truth (target_spoke_next) directly:
@@ -33,6 +21,16 @@ Labeling Logic:
     
     All samples get 'high' confidence since they're based on ground truth.
     Context (addressing, addressees) is used for reasoning but not decision.
+
+Source Metadata:
+    Each decision point includes metadata about its origin:
+        - dp['source']: 'explicit' (from Stage 1) or 'gemini_inferred' (from Stage 1b)
+        - dp['is_explicit']: True if from explicit annotations, False if AI-inferred
+        - dp['inference_confidence']: 0-10 scale (10 = ground truth, lower = AI confidence)
+    
+    You can filter or analyze by source:
+        explicit_samples = [dp for dp in decision_points if dp.get('is_explicit', True)]
+        ai_samples = [dp for dp in decision_points if not dp.get('is_explicit', True)]
 """
 
 import json
@@ -40,6 +38,8 @@ import re
 from pathlib import Path
 from typing import Dict, Tuple
 from collections import Counter
+
+from tqdm import tqdm
 
 # ============================================================================
 # CONFIGURATION
@@ -49,16 +49,12 @@ JSON_DUMPS_DIR = Path('json_dumps')
 INPUT_FILE = JSON_DUMPS_DIR / 'stage2_decision_points.json'
 OUTPUT_FILE = JSON_DUMPS_DIR / 'stage3_categorized_samples.json'
 
-# Category descriptions
+# Category descriptions (4 categories)
 CATEGORY_NAMES = {
-    'I1': 'SPEAK - Direct address',
-    'I2': 'SPEAK - Context follow-up',
-    'I3': 'SPEAK - Implicit redirect',
-    'S1': 'SILENT - No reference',
-    'S2': 'SILENT - Mentioned but not addressed',
-    'S3': 'SILENT - Context shifted away',
-    'S4': 'SILENT - Incomplete sentence',
-    'S5': 'SILENT - Explicit context switch'
+    'SPEAK_explicit': 'Target was directly addressed',
+    'SPEAK_implicit': 'Target spoke but not from direct address',
+    'SILENT_no_ref': 'No reference to target',
+    'SILENT_ref': 'Target mentioned or in context, but did not speak',
 }
 
 # ============================================================================
@@ -194,9 +190,8 @@ def was_target_in_recent_exchange(context_turns: list, target_speaker: str, wind
 
 def assign_category(sample: Dict) -> str:
     """
-    Assign PDF category to a labeled sample using decision tree logic
-    
-    Returns: category (S1-S5 or I1-I3)
+    Assign category to a labeled sample using decision tree logic.
+    Returns one of: SPEAK_explicit, SPEAK_implicit, SILENT_no_ref, SILENT_ref
     """
     decision = sample['decision']
     target_speaker = sample['target_speaker']
@@ -204,54 +199,21 @@ def assign_category(sample: Dict) -> str:
     current_text = sample['current_turn']['text']
     context_turns = sample['context_turns']
     
-    # ========================================================================
-    # SPEAK CATEGORIES (I1-I3)
-    # ========================================================================
+    # SPEAK categories
     if decision == 'SPEAK':
-        # I1: Direct address (explicit addressee)
         if target_is_addressed:
-            return 'I1'
-        
-        # I2: Context follow-up (target in ongoing exchange)
-        # Target spoke next but wasn't explicitly addressed
-        # This means they're continuing a conversation
-        elif was_target_in_recent_exchange(context_turns, target_speaker):
-            return 'I2'
-        
-        # I3: Implicit redirect (general question, target is logical respondent)
-        else:
-            return 'I3'
+            return 'SPEAK_explicit'
+        # I2 or I3 -> SPEAK_implicit
+        return 'SPEAK_implicit'
     
-    # ========================================================================
-    # SILENT CATEGORIES (S1-S5)
-    # ========================================================================
-    else:  # SILENT
-        # Check if target is mentioned (but not addressed)
+    # SILENT categories: S2 (mentioned), S3 (recent exchange) -> SILENT_ref; else SILENT_no_ref
+    else:
         target_mentioned = check_target_mentioned(current_text, target_speaker)
-        
-        # S2: Target mentioned but not addressed
-        # Example: "I told A about this" (A mentioned but not being asked)
         if target_mentioned and not target_is_addressed:
-            return 'S2'
-        
-        # S4: Incomplete sentence
-        # Example: "So I was thinking um..." or "Yeah..."
-        if check_incomplete_sentence(current_text):
-            return 'S4'
-        
-        # S3: Target was in prior exchange but shifted away
-        # Example: A and B were talking, now B talks to C
+            return 'SILENT_ref'
         if was_target_in_recent_exchange(context_turns, target_speaker, window=2):
-            return 'S3'
-        
-        # S5: Context switch (someone else is now addressed)
-        # Example: B addresses C (not A), so A should stay silent
-        if sample['addressees_in_current'] and not target_is_addressed:
-            return 'S5'
-        
-        # S1: No reference to target (default SILENT)
-        # No addressing, no mention, target not involved
-        return 'S1'
+            return 'SILENT_ref'
+        return 'SILENT_no_ref'
 
 
 # ============================================================================
@@ -265,6 +227,21 @@ def print_statistics(categorized_samples: list):
     print("="*70)
     
     total_samples = len(categorized_samples)
+    
+    # Source distribution (if available)
+    if total_samples > 0 and 'source' in categorized_samples[0]:
+        sources = [s.get('source', 'unknown') for s in categorized_samples]
+        source_counts = Counter(sources)
+        print(f"\nSource distribution:")
+        for source, count in source_counts.most_common():
+            print(f"  {source}: {count:,} ({count/total_samples*100:.1f}%)")
+        
+        explicit_count = sum(1 for s in categorized_samples if s.get('is_explicit', True))
+        inferred_count = total_samples - explicit_count
+        if inferred_count > 0:
+            print(f"\nAnnotation type:")
+            print(f"  Explicit annotations: {explicit_count:,} ({explicit_count/total_samples*100:.1f}%)")
+            print(f"  AI-inferred: {inferred_count:,} ({inferred_count/total_samples*100:.1f}%)")
     
     # Decision counts
     decisions = [s['decision'] for s in categorized_samples]
@@ -285,25 +262,14 @@ def print_statistics(categorized_samples: list):
     category_counts = Counter(categories)
     
     print(f"\nCategory distribution:")
-    print(f"\nSPEAK categories:")
-    for cat in ['I1', 'I2', 'I3']:
+    for cat in ['SPEAK_explicit', 'SPEAK_implicit', 'SILENT_no_ref', 'SILENT_ref']:
         count = category_counts.get(cat, 0)
         if count > 0:
             print(f"  {cat} ({CATEGORY_NAMES[cat]}): {count:,} ({count/total_samples*100:.1f}%)")
     
-    print(f"\nSILENT categories:")
-    for cat in ['S1', 'S2', 'S3', 'S4', 'S5']:
-        count = category_counts.get(cat, 0)
-        if count > 0:
-            print(f"  {cat} ({CATEGORY_NAMES[cat]}): {count:,} ({count/total_samples*100:.1f}%)")
-    
-    # Overall SPEAK vs SILENT
-    speak_count = sum(category_counts.get(cat, 0) for cat in ['I1', 'I2', 'I3'])
-    silent_count = sum(category_counts.get(cat, 0) for cat in ['S1', 'S2', 'S3', 'S4', 'S5'])
-    
-    print(f"\nOverall:")
-    print(f"  SPEAK (I1-I3): {speak_count:,} ({speak_count/total_samples*100:.1f}%)")
-    print(f"  SILENT (S1-S5): {silent_count:,} ({silent_count/total_samples*100:.1f}%)")
+    speak_count = sum(category_counts.get(cat, 0) for cat in ['SPEAK_explicit', 'SPEAK_implicit'])
+    silent_count = sum(category_counts.get(cat, 0) for cat in ['SILENT_no_ref', 'SILENT_ref'])
+    print(f"\nOverall: SPEAK {speak_count:,}, SILENT {silent_count:,}")
     
     # Category × Confidence
     print(f"\nCategory × Confidence:")
@@ -332,7 +298,7 @@ def print_examples(categorized_samples: list):
     print("EXAMPLES BY CATEGORY")
     print("="*70 + "\n")
     
-    categories = ['I1', 'I2', 'I3', 'S1', 'S2', 'S3', 'S4', 'S5']
+    categories = ['SPEAK_explicit', 'SPEAK_implicit', 'SILENT_no_ref', 'SILENT_ref']
     
     for cat in categories:
         examples = [s for s in categorized_samples if s['category'] == cat][:2]
@@ -375,7 +341,7 @@ def main():
     # Label and categorize all decision points in one pass
     categorized_samples = []
     
-    for i, dp in enumerate(decision_points):
+    for dp in tqdm(decision_points, desc="Label & categorize", unit=" sample"):
         # Stage 3: Label (SPEAK/SILENT) and assign confidence/reason
         decision, confidence, reason = label_decision_point(dp)
         
@@ -390,9 +356,6 @@ def main():
         labeled_sample['category'] = category
         
         categorized_samples.append(labeled_sample)
-        
-        if (i + 1) % 10000 == 0:
-            print(f"Processed {i+1:,}/{len(decision_points):,} decision points...")
     
     print("="*70)
     print(f"\nLabeled and categorized {len(categorized_samples):,} samples")

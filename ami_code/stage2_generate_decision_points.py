@@ -8,7 +8,7 @@ Goal:
     points for each speaker: "Should they respond after this turn?"
 
 Input:
-    - stage1_sequences.json from Stage 1
+    - stage1_combined_sequences.json from Stage 1 (explicit + inferred sequences)
 
 Output:
     - stage2_decision_points.json - decision points for Stage 3
@@ -18,12 +18,20 @@ Process:
     2. At each turn, for each speaker (except current speaker):
        - Create a decision point: "Should this speaker respond after this turn?"
        - Record context, current turn, addressing info, and ground truth
+       - Preserve source metadata (explicit vs AI-inferred) for downstream stages
+    
+Metadata Preserved:
+    - source: 'explicit' (from Stage 1) or 'gemini_inferred' (from Stage 1b)
+    - is_explicit: True if from explicit annotations, False if AI-inferred
+    - inference_confidence: 0-10 scale (10 = ground truth, lower = AI inference confidence)
 """
 
 import json
 from pathlib import Path
 from typing import List, Dict, Set
 from collections import Counter
+
+from tqdm import tqdm
 
 # ============================================================================
 # CONFIGURATION
@@ -84,6 +92,12 @@ def generate_decision_points_from_sequence(sequence: Dict) -> List[Dict]:
     
     sequence_id = sequence['sequence_id']
     meeting_id = sequence['meeting_id']
+    
+    # Extract source metadata (if available)
+    source = sequence.get('source', 'unknown')  # 'explicit', 'gemini_inferred', or 'unknown'
+    addressing_turn = sequence.get('addressing_turn', {})
+    is_explicit = addressing_turn.get('is_explicit', True)  # Default to True for backward compatibility
+    inference_confidence = addressing_turn.get('inference_confidence', 10)  # Default to 10 (ground truth)
     
     # Get all speakers in this conversation
     all_speakers = get_all_speakers_in_sequence(sequence)
@@ -160,6 +174,11 @@ def generate_decision_points_from_sequence(sequence: Dict) -> List[Dict]:
                 'turn_index': turn_idx,
                 'turn_type': current_turn['turn_type'],
                 
+                # Source metadata (for tracking AI vs explicit annotations)
+                'source': source,  # 'explicit', 'gemini_inferred', or 'unknown'
+                'is_explicit': is_explicit,  # True if from explicit annotations, False if AI-inferred
+                'inference_confidence': inference_confidence,  # 0-10 scale (10 = ground truth)
+                
                 # Context: all turns before current
                 'context_turns': [
                     {'speaker': t['speaker'], 'text': t['text']} 
@@ -190,6 +209,29 @@ def print_statistics(all_decision_points: List[Dict]):
     print("\n" + "="*70)
     print("STAGE 2 STATISTICS")
     print("="*70)
+    
+    # Source distribution (explicit vs AI-inferred)
+    if 'source' in all_decision_points[0]:
+        sources = [dp.get('source', 'unknown') for dp in all_decision_points]
+        source_counts = Counter(sources)
+        print(f"\nSource distribution:")
+        for source, count in source_counts.most_common():
+            print(f"  {source}: {count:,} ({count/len(all_decision_points)*100:.1f}%)")
+        
+        # Explicit vs inferred
+        explicit_count = sum(1 for dp in all_decision_points if dp.get('is_explicit', True))
+        inferred_count = len(all_decision_points) - explicit_count
+        print(f"\nAnnotation type:")
+        print(f"  Explicit annotations: {explicit_count:,} ({explicit_count/len(all_decision_points)*100:.1f}%)")
+        print(f"  AI-inferred: {inferred_count:,} ({inferred_count/len(all_decision_points)*100:.1f}%)")
+        
+        # Inference confidence for AI-generated samples
+        if inferred_count > 0:
+            inferred_confidences = [dp.get('inference_confidence', 0) for dp in all_decision_points if not dp.get('is_explicit', True)]
+            if inferred_confidences:
+                print(f"\nAI inference confidence (0-10 scale):")
+                print(f"  Average: {sum(inferred_confidences)/len(inferred_confidences):.1f}/10")
+                print(f"  Range: {min(inferred_confidences)} - {max(inferred_confidences)}")
     
     # Turn types
     turn_types = [dp['turn_type'] for dp in all_decision_points]
@@ -272,12 +314,9 @@ def main():
     # Generate decision points from all sequences
     all_decision_points = []
     
-    for i, sequence in enumerate(sequences):
+    for sequence in tqdm(sequences, desc="Decision points", unit="seq"):
         dps = generate_decision_points_from_sequence(sequence)
         all_decision_points.extend(dps)
-        
-        if (i + 1) % 50 == 0:
-            print(f"Processed {i+1}/{len(sequences)} sequences...")
     
     print("="*70)
     print(f"\nGenerated {len(all_decision_points):,} decision points from {len(sequences)} sequences")
