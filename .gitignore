@@ -21,3 +21,6 @@ __pycache__/
 *.json
 *.jsonl
 *.xml
+
+# Config files (may contain secrets)
+**/config.py
