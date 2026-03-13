@@ -306,6 +306,46 @@ python evaluation/evaluate_finetuned.py --dataset friends --model qwen3-4b-instr
 - **Multi-GPU fine-tuned evaluation (gpt-oss-20b + SPGI):** When evaluating `gpt-oss-20b` on the SPGI dataset, `evaluate_finetuned.py` automatically spawns one worker per GPU (up to 8), each evaluating a shard of the test set. Workers write shard result files; the main process merges them by original sample order, recomputes metrics, writes the final results, and deletes the shard files. No extra flags are required; do not use `--shard-index`/`--num-shards` unless you are running the workers manually.
 - Results are written to `evaluation/results/` (e.g. `finetuned_results_friends_qwen3-4b-instruct_r32.json` and `baseline_vs_finetuned_...`). To evaluate a **mid checkpoint** (e.g. `checkpoint-100`), use `--checkpoint checkpoint-100`. Mid checkpoints are loadable when training used the provided FSDP config (`accelerate_fsdp_config.yaml`), which saves each checkpoint in full (FULL_STATE_DICT). Default is `--checkpoint final`.
 
+### 7. Rebuild dataset from raw sources *(optional)*
+
+If you want to re-run the full data processing pipeline from the original raw corpora (e.g. to change filtering or categorization hyperparameters), each domain has its own pipeline under `data_pipelines/`. Each pipeline produces a `data_final/stage4_filtered_samples.jsonl` which can be used in place of the HuggingFace download.
+
+Update `config.py` in the relevant pipeline directory to point to your local raw corpus, then run the stages in order:
+
+**AMI** — requires the [AMI Corpus](https://groups.inf.ed.ac.uk/ami/corpus/) XML files placed in `data_pipelines/ami/ami_corpus/`:
+
+```bash
+cd data_pipelines/ami
+python stage1_extract_dialogues.py          # Extract explicit dialogues from XML
+python stage1b_infer_addressees.py          # Infer missing addressees via Gemini (requires GEMINI_API_KEY)
+python stage2_generate_decision_points.py   # Generate SPEAK/SILENT decision points
+python stage3_label_and_categorize.py       # Label and categorize
+python stage4_filter_quality.py             # Filter, deduplicate, balance → data_final/
+```
+
+**Friends** — requires the [Friends-MMC](https://github.com/yellow-binary-tree/Friends-MMC) metadata placed in `data_pipelines/friends/friends_mmc/`:
+
+```bash
+cd data_pipelines/friends
+python stage1_extract_sequences.py          # Extract sequences from Friends-MMC metadata
+python stage2_generate_decision_points.py
+python stage3_label_and_categorize.py
+python stage4_filter_quality.py             # → data_final/
+```
+
+**SPGI** — requires the [SPGISpeech 2.0](https://datasets.kensho.com/datasets/spgispeech2) segments placed in `data_pipelines/spgi/spgi_dataset/`:
+
+```bash
+cd data_pipelines/spgi
+python stage1_extract_turns.py              # Extract turns from SPGI word segments
+python stage1b_build_sequences.py           # Build heuristic sequences
+python stage2_generate_decision_points.py
+python stage3_label_and_categorize.py
+python stage4_filter_quality.py             # → data_final/
+```
+
+Hyperparameters for each stage (filtering thresholds, deduplication settings, balance ratios) are in the respective `config.py`.
+
 ---
 
 ## Configuration
