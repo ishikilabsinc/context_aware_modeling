@@ -3,6 +3,9 @@
 
 # Ignore dataset folders
 datasets/
+data/ami/
+data/friends/
+data/spgi/
 
 # Ignore generated data inside ami
 ami/data_final/
@@ -19,7 +22,6 @@ __pycache__/
 *.pyc
 
 # Benchmarking and fine-tuning outputs
-data/
 fine_tuning/checkpoints/
 benchmarking/results/
 evaluation/results/
