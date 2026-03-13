@@ -1,27 +1,29 @@
-# Unified requirements for context-aware turn-taking (benchmarking, fine_tuning, evaluation, ami).
+# Requirements for context-aware turn-taking modelling.
 # Install from repo root: pip install -r requirements.txt
 
-# Core
+# Core ML
 torch>=2.0.0
 transformers>=4.37.0
-numpy>=1.24.0
 accelerate>=0.20.0
+numpy>=1.24.0
 
-# Benchmarking (prepare_data S3, evaluate_baseline, run_benchmark)
-boto3>=1.28.0
-vllm>=0.2.0
-
-# Fine-tuning (LoRA, train_lora, plot_training_curve)
+# Fine-tuning (LoRA)
 peft>=0.6.0
 bitsandbytes>=0.41.0
-datasets>=2.14.0
-matplotlib>=3.5.0
 
-# Evaluation uses same stack as benchmarking + peft (load_finetuned).
+# Dataset download
+huggingface_hub>=0.20.0
+
+# Benchmarking / Evaluation
+vllm>=0.2.0
+openai>=1.0.0
 
 # CoT reasoning generation (fine_tuning/generate_reasoning.py)
 google-genai>=1.0.0
 
-# AMI pipeline (optional)
+# Data pipeline (data_pipeline/stage1b_infer_addressees.py)
 google-generativeai>=0.3.0
-openai>=1.0.0
+
+# Utilities
+tqdm>=4.65.0
+matplotlib>=3.5.0

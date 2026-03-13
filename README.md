@@ -31,13 +31,42 @@ This repository trains and evaluates language models for **context-aware turn-ta
 
 **Python:** 3.9 or 3.10 recommended (not tested on 3.11+).
 
-From the repo root, install dependencies once:
+### 1. Hugging Face token
+
+Required to download the dataset and models from the [Hugging Face Hub](https://huggingface.co/settings/tokens).
+
+```bash
+# Add to your shell profile (~/.zshrc or ~/.bashrc)
+echo 'export HF_TOKEN="hf_your_token_here"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### 2. Gemini API key
+
+Required for CoT reasoning generation (`fine_tuning/generate_reasoning.py`) and Gemini baseline evaluation.
+Get a key at [https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).
+
+```bash
+echo 'export GEMINI_API_KEY="your_gemini_key_here"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### 3. OpenAI API key *(optional)*
+
+Only needed if you want to run `gpt-5.2` as a baseline comparison model. Skip this if you are only using local models or Gemini.
+
+```bash
+echo 'export OPENAI_API_KEY="your_openai_key_here"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### 4. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-This covers benchmarking, fine-tuning, evaluation, and the optional AMI pipeline. Use a virtual environment and a Python with CUDA support for GPU runs.
+Use a virtual environment and a Python with CUDA support for GPU runs.
 
 ---
 
