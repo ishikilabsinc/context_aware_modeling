@@ -1,5 +1,7 @@
 # Context-Aware Turn-Taking Modeling
 
+[![Paper](https://img.shields.io/badge/Paper-arXiv-red)](https://arxiv.org/abs/2603.11409) [![Dataset](https://img.shields.io/badge/Dataset-HuggingFace-yellow)](https://huggingface.co/datasets/ishiki-labs/multi-party-dialogue) [![Models](https://img.shields.io/badge/Models-HuggingFace-blue)](https://huggingface.co/ishiki-labs/models)
+
 This repository trains and evaluates language models for **context-aware turn-taking**: deciding whether a target speaker should **SPEAK** or **STAY SILENT** after a pause in multi-party conversation, using full dialogue context.
 
 ## Overview
