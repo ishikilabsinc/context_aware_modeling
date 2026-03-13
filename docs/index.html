@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Speak or Stay Silent: Context-Aware Turn-Taking in Multi-Party Dialogue</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --navy: #0f1f3d;
+      --navy-light: #162847;
+      --teal: #0ea5e9;
+      --teal-dark: #0284c7;
+      --green: #10b981;
+      --red: #ef4444;
+      --amber: #f59e0b;
+      --gray-50: #f8fafc;
+      --gray-100: #f1f5f9;
+      --gray-200: #e2e8f0;
+      --gray-400: #94a3b8;
+      --gray-600: #475569;
+      --gray-700: #334155;
+      --gray-800: #1e293b;
+      --gray-900: #0f172a;
+      --white: #ffffff;
+      --font: 'Inter', system-ui, sans-serif;
+      --mono: 'JetBrains Mono', 'Courier New', monospace;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font);
+      font-size: 16px;
+      line-height: 1.7;
+      color: var(--gray-700);
+      background: var(--white);
+    }
+
+    /* ── HEADER ── */
+    header {
+      background: linear-gradient(135deg, var(--navy) 0%, var(--navy-light) 100%);
+      color: var(--white);
+      padding: 64px 24px 56px;
+      text-align: center;
+    }
+
+    .venue-badge {
+      display: inline-block;
+      background: rgba(14,165,233,0.2);
+      border: 1px solid rgba(14,165,233,0.4);
+      color: var(--teal);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 4px 14px;
+      border-radius: 20px;
+      margin-bottom: 24px;
+    }
+
+    header h1 {
+      font-size: clamp(24px, 4vw, 42px);
+      font-weight: 700;
+      line-height: 1.25;
+      max-width: 820px;
+      margin: 0 auto 28px;
+      letter-spacing: -0.02em;
+    }
+
+    .authors {
+      font-size: 15px;
+      color: rgba(255,255,255,0.85);
+      margin-bottom: 8px;
+    }
+
+    .authors a {
+      color: rgba(255,255,255,0.9);
+      text-decoration: none;
+      font-weight: 500;
+    }
+
+    .authors a:hover { text-decoration: underline; }
+
+    .affiliations {
+      font-size: 13px;
+      color: rgba(255,255,255,0.55);
+      margin-bottom: 36px;
+    }
+
+    .link-buttons {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 22px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.2s ease;
+      border: 2px solid transparent;
+    }
+
+    .btn-primary {
+      background: var(--teal);
+      color: var(--white);
+      border-color: var(--teal);
+    }
+
+    .btn-primary:hover { background: var(--teal-dark); border-color: var(--teal-dark); }
+
+    .btn-outline {
+      background: transparent;
+      color: var(--white);
+      border-color: rgba(255,255,255,0.35);
+    }
+
+    .btn-outline:hover { background: rgba(255,255,255,0.1); border-color: rgba(255,255,255,0.6); }
+
+    /* ── NAV ── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(15,31,61,0.97);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+
+    nav ul {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 0;
+      list-style: none;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 0 16px;
+    }
+
+    nav ul li a {
+      display: block;
+      color: rgba(255,255,255,0.65);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 14px 16px;
+      transition: color 0.2s;
+    }
+
+    nav ul li a:hover { color: var(--teal); }
+
+    /* ── LAYOUT ── */
+    main { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+
+    section {
+      padding: 64px 0 48px;
+      border-bottom: 1px solid var(--gray-200);
+    }
+
+    section:last-child { border-bottom: none; }
+
+    h2 {
+      font-size: 26px;
+      font-weight: 700;
+      color: var(--navy);
+      margin-bottom: 24px;
+      letter-spacing: -0.02em;
+    }
+
+    h3 {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--gray-800);
+      margin: 32px 0 12px;
+    }
+
+    p { margin-bottom: 16px; }
+
+    /* ── ABSTRACT ── */
+    .abstract-box {
+      background: var(--gray-50);
+      border-left: 4px solid var(--teal);
+      border-radius: 0 8px 8px 0;
+      padding: 24px 28px;
+      font-size: 15px;
+      line-height: 1.8;
+      color: var(--gray-700);
+    }
+
+    /* ── TASK DIAGRAM ── */
+    .diagram-container {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin: 28px 0;
+    }
+
+    @media (max-width: 600px) {
+      .diagram-container { grid-template-columns: 1fr; }
+    }
+
+    .diagram-box {
+      border-radius: 10px;
+      padding: 20px;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    .diagram-box.old {
+      background: #fff5f5;
+      border: 1.5px solid #fecaca;
+    }
+
+    .diagram-box.new {
+      background: #f0fdf4;
+      border: 1.5px solid #86efac;
+    }
+
+    .diagram-box .label {
+      font-family: var(--font);
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 14px;
+    }
+
+    .diagram-box.old .label { color: var(--red); }
+    .diagram-box.new .label { color: var(--green); }
+
+    .diagram-box pre {
+      white-space: pre-wrap;
+      line-height: 1.6;
+      color: var(--gray-700);
+    }
+
+    /* ── CATEGORY CARDS ── */
+    .category-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      margin: 28px 0;
+    }
+
+    @media (max-width: 600px) {
+      .category-grid { grid-template-columns: 1fr; }
+    }
+
+    .cat-card {
+      border-radius: 10px;
+      padding: 20px;
+      border: 1.5px solid;
+    }
+
+    .cat-card .cat-id {
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      margin-bottom: 8px;
+    }
+
+    .cat-card h4 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .cat-card p { font-size: 14px; margin: 0; }
+
+    .cat-speak-1 { background: #eff6ff; border-color: #bfdbfe; }
+    .cat-speak-1 .cat-id, .cat-speak-1 h4 { color: #1d4ed8; }
+
+    .cat-speak-2 { background: #f0fdf4; border-color: #86efac; }
+    .cat-speak-2 .cat-id, .cat-speak-2 h4 { color: #15803d; }
+
+    .cat-silent-1 { background: #fefce8; border-color: #fde047; }
+    .cat-silent-1 .cat-id, .cat-silent-1 h4 { color: #a16207; }
+
+    .cat-silent-2 { background: #fff7ed; border-color: #fdba74; }
+    .cat-silent-2 .cat-id, .cat-silent-2 h4 { color: #c2410c; }
+
+    /* ── TABLES ── */
+    .table-wrap { overflow-x: auto; margin: 20px 0; border-radius: 10px; border: 1px solid var(--gray-200); }
+
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+
+    thead { background: var(--navy); color: var(--white); }
+
+    thead th {
+      padding: 12px 16px;
+      text-align: left;
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: 0.03em;
+      white-space: nowrap;
+    }
+
+    tbody tr:nth-child(even) { background: var(--gray-50); }
+    tbody tr:hover { background: #e0f2fe; }
+
+    tbody td {
+      padding: 11px 16px;
+      border-bottom: 1px solid var(--gray-100);
+      white-space: nowrap;
+    }
+
+    .total-row { font-weight: 700; background: var(--gray-100) !important; }
+
+    td.best { font-weight: 700; color: var(--navy); }
+
+    /* ── HIGHLIGHT CARDS ── */
+    .highlights {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin: 28px 0;
+    }
+
+    @media (max-width: 700px) {
+      .highlights { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 480px) {
+      .highlights { grid-template-columns: 1fr; }
+    }
+
+    .highlight-card {
+      background: var(--gray-50);
+      border: 1.5px solid var(--gray-200);
+      border-radius: 10px;
+      padding: 20px;
+      text-align: center;
+    }
+
+    .highlight-card .metric {
+      font-size: 32px;
+      font-weight: 700;
+      color: var(--teal-dark);
+      line-height: 1;
+      margin-bottom: 8px;
+    }
+
+    .highlight-card .metric-label {
+      font-size: 13px;
+      color: var(--gray-600);
+      line-height: 1.4;
+    }
+
+    /* ── FINDING BLOCKS ── */
+    .finding {
+      background: var(--gray-50);
+      border-radius: 10px;
+      border-left: 4px solid var(--teal);
+      padding: 16px 20px;
+      margin: 16px 0;
+      font-size: 14px;
+    }
+
+    .finding strong { color: var(--navy); }
+
+    /* ── PROMPT BOX ── */
+    .prompt-box {
+      background: var(--gray-900);
+      color: #e2e8f0;
+      border-radius: 10px;
+      padding: 20px 24px;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.7;
+      overflow-x: auto;
+      margin: 16px 0;
+    }
+
+    .prompt-box .prompt-label {
+      font-family: var(--font);
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--teal);
+      margin-bottom: 12px;
+    }
+
+    /* ── EXAMPLES ── */
+    .example-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin: 24px 0;
+    }
+
+    @media (max-width: 680px) {
+      .example-grid { grid-template-columns: 1fr; }
+    }
+
+    details {
+      border-radius: 10px;
+      border: 1.5px solid var(--gray-200);
+      overflow: hidden;
+    }
+
+    details[open] { border-color: var(--teal); }
+
+    summary {
+      padding: 14px 18px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 14px;
+      background: var(--gray-50);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      list-style: none;
+      user-select: none;
+    }
+
+    summary::-webkit-details-marker { display: none; }
+
+    summary::before {
+      content: '▶';
+      font-size: 10px;
+      color: var(--teal);
+      transition: transform 0.2s;
+      flex-shrink: 0;
+    }
+
+    details[open] summary::before { transform: rotate(90deg); }
+
+    .example-content {
+      padding: 18px;
+      font-size: 13.5px;
+      background: var(--white);
+    }
+
+    .example-content .context-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--gray-400);
+      margin-bottom: 8px;
+    }
+
+    .dialogue-line { margin-bottom: 6px; }
+    .dialogue-line .speaker { font-weight: 600; color: var(--navy); }
+
+    .current-turn {
+      background: var(--gray-50);
+      border-left: 3px solid var(--teal);
+      border-radius: 0 6px 6px 0;
+      padding: 8px 12px;
+      margin: 12px 0;
+      font-size: 13px;
+    }
+
+    .decision-badge {
+      display: inline-block;
+      padding: 3px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      margin: 8px 0 4px;
+    }
+
+    .badge-speak { background: #dcfce7; color: #15803d; }
+    .badge-silent { background: #fee2e2; color: #b91c1c; }
+
+    .reasoning-text {
+      font-size: 13px;
+      color: var(--gray-600);
+      font-style: italic;
+      margin-top: 6px;
+    }
+
+    /* ── CITATION ── */
+    .citation-box {
+      background: var(--gray-900);
+      color: #e2e8f0;
+      border-radius: 10px;
+      padding: 24px 28px;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.8;
+      position: relative;
+      margin-top: 20px;
+    }
+
+    .copy-btn {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.2);
+      color: rgba(255,255,255,0.7);
+      font-size: 12px;
+      font-family: var(--font);
+      font-weight: 500;
+      padding: 5px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .copy-btn:hover { background: rgba(255,255,255,0.18); color: var(--white); }
+
+    .bibtex-key { color: #7dd3fc; }
+    .bibtex-field { color: #a5f3fc; }
+    .bibtex-value { color: #fde68a; }
+    .bibtex-brace { color: #94a3b8; }
+
+    /* ── FOOTER ── */
+    footer {
+      background: var(--gray-900);
+      color: rgba(255,255,255,0.45);
+      text-align: center;
+      padding: 28px 24px;
+      font-size: 13px;
+    }
+
+    footer a { color: rgba(255,255,255,0.55); text-decoration: none; }
+    footer a:hover { color: var(--teal); }
+
+    /* ── MISC ── */
+    .section-tag {
+      display: inline-block;
+      background: rgba(14,165,233,0.1);
+      color: var(--teal-dark);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      padding: 3px 10px;
+      border-radius: 4px;
+      margin-bottom: 12px;
+    }
+
+    .tag-speak { background: #dcfce7; color: #15803d; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 700; }
+    .tag-silent { background: #fee2e2; color: #b91c1c; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 700; }
+
+    .stat-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+
+    .stat-bar-wrap { flex: 1; background: var(--gray-100); border-radius: 4px; height: 8px; }
+    .stat-bar { height: 8px; border-radius: 4px; background: var(--teal); }
+
+    .method-steps {
+      counter-reset: steps;
+      margin: 16px 0;
+    }
+
+    .method-step {
+      display: flex;
+      gap: 16px;
+      margin-bottom: 20px;
+      align-items: flex-start;
+    }
+
+    .step-num {
+      flex-shrink: 0;
+      width: 32px;
+      height: 32px;
+      background: var(--navy);
+      color: var(--white);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      font-weight: 700;
+      margin-top: 2px;
+    }
+
+    .step-body h4 { font-size: 15px; font-weight: 600; color: var(--gray-800); margin-bottom: 6px; }
+    .step-body p { font-size: 14px; margin: 0; }
+  </style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════
+     HEADER
+══════════════════════════════════════════════ -->
+<header>
+  <h1>Speak or Stay Silent: Context-Aware Turn-Taking in Multi-Party Dialogue</h1>
+  <div class="link-buttons">
+    <a href="https://arxiv.org/abs/2603.11409" class="btn btn-primary">
+      <!-- paper icon -->
+      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+      Paper
+    </a>
+    <a href="https://github.com/ishikilabsinc/context_aware_modeling/" class="btn btn-outline">
+      <!-- github icon -->
+      <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.418 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.009-.868-.013-1.703-2.782.604-3.369-1.34-3.369-1.34-.454-1.154-1.11-1.462-1.11-1.462-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.578 9.578 0 0112 6.836c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.163 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
+      Code
+    </a>
+    <a href="https://huggingface.co/datasets/ishiki-labs/multi-party-dialogue" class="btn btn-outline">
+      <!-- hf icon -->
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
+      Dataset
+    </a>
+    <a href="https://huggingface.co/ishiki-labs/models" class="btn btn-outline">
+      <!-- model icon -->
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>
+      Models
+    </a>
+  </div>
+</header>
+
+<!-- ══════════════════════════════════════════════
+     NAV
+══════════════════════════════════════════════ -->
+<nav aria-label="Page sections">
+  <ul>
+    <li><a href="#abstract">Abstract</a></li>
+    <li><a href="#task">Task</a></li>
+    <li><a href="#benchmark">Decision Categories</a></li>
+    <!-- <li><a href="#citation">Citation</a></li> -->
+  </ul>
+</nav>
+
+<main>
+
+<!-- ══════════════════════════════════════════════
+     ABSTRACT
+══════════════════════════════════════════════ -->
+<section id="abstract">
+  <div class="section-tag">Abstract</div>
+  <div class="abstract-box">
+    Existing voice AI assistants treat every detected pause as an invitation to speak. This works in dyadic dialogue, but in multi-party settings, where an AI assistant participates alongside multiple speakers, pauses are abundant and ambiguous. An assistant that speaks on every pause becomes disruptive rather than useful. In this work, we formulate <strong>context-aware turn-taking</strong>: at every detected pause, given the full conversation context, our method decides whether the assistant should speak or stay silent. We introduce a benchmark of over <strong>120K labeled conversations</strong> spanning three multi-party corpora. Evaluating eight recent large language models, we find that they <strong>consistently fail</strong> at context-aware turn-taking under zero-shot prompting. We then propose a supervised fine-tuning approach with reasoning traces, improving balanced accuracy by <strong>up to 23 percentage points</strong>. Our findings suggest that context-aware turn-taking is not an emergent capability; it must be explicitly trained.
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════
+     TASK OVERVIEW
+══════════════════════════════════════════════ -->
+<section id="task">
+  <div class="section-tag">Task Overview</div>
+  <h2>Context-Aware Turn-Taking</h2>
+
+  <p>
+    Most dialogue systems assume <em>dyadic</em> interaction — one user, one assistant. In real-world multi-party settings (meetings, group calls, social conversations), the challenge shifts from <em>what to say</em> to <em>whether and when to speak</em>. An AI assistant in a Zoom meeting that responds at every pause becomes disruptive; one that stays silent when addressed fails its role.
+  </p>
+
+  <div class="diagram-container">
+    <div class="diagram-box old">
+      <div class="label">❌ Traditional approach</div>
+      <pre>Speaker A: [pause]
+  → AI always speaks
+
+Speaker A: "Hey B, what do you think?"
+  → AI speaks (interrupts!)
+
+Speaker A: ...talking to B...
+  → AI speaks (disrupts!)</pre>
+    </div>
+    <div class="diagram-box new">
+      <div class="label">✓ Context-aware approach</div>
+      <pre>Speaker A: "Hey AI, can you help?"
+  → AI: <span style="color:#16a34a;font-weight:600">SPEAK ✓</span>
+
+Speaker A: "Hey B, what do you think?"
+  → AI: <span style="color:#b91c1c;font-weight:600">SILENT ✓</span>
+
+Speaker A: ...talking to B...
+  → AI: <span style="color:#b91c1c;font-weight:600">SILENT ✓</span></pre>
+    </div>
+  </div>
+
+  <h3>Problem Formulation</h3>
+  <p>
+    Given a multi-party conversation with <em>N</em> speakers, let <em>C<sub>t</sub> = (u<sub>1</sub>, u<sub>2</sub>, …, u<sub>t</sub>)</em> denote the sequence of utterances up to time <em>t</em>. After utterance <em>u<sub>t</sub></em>, a pause is detected. For a designated target speaker <em>k ≠ s<sub>t</sub></em>, the goal is to predict a binary decision:
+  </p>
+  <p style="text-align:center; font-size:18px; font-weight:700; color:var(--navy); margin:24px 0;">
+    <span class="tag-speak">SPEAK</span>
+    &nbsp; or &nbsp;
+    <span class="tag-silent">SILENT</span>
+  </p>
+  <p>
+    This formulation is general: any participant can serve as the target speaker. During training, every speaker's behavior in natural conversation provides labeled examples. During inference, the target speaker is the AI assistant.
+  </p>
+</section>
+
+<!-- ══════════════════════════════════════════════
+     BENCHMARK
+══════════════════════════════════════════════ -->
+<section id="benchmark">
+  <div class="section-tag">Decision Categories</div>
+  <h2>Four Types of Turn-Taking Decisions</h2>
+
+  <p>
+    We construct a benchmark from three publicly available multi-party corpora spanning distinct conversational settings, generating one decision point per non-speaking participant at each utterance boundary.
+  </p>
+
+  <h3>Four Decision Categories</h3>
+  <p>Each decision point is assigned a fine-grained category capturing qualitatively distinct speaking situations:</p>
+
+  <div class="category-grid">
+    <div class="cat-card cat-speak-1">
+      <div class="cat-id">I1 — SPEAK</div>
+      <h4>Explicit Address</h4>
+      <p>The target speaker is directly addressed by name or role. Unambiguously expected to respond — the easiest SPEAK cases.</p>
+    </div>
+    <div class="cat-card cat-speak-2">
+      <div class="cat-id">I2 — SPEAK</div>
+      <h4>Contextual Intervention</h4>
+      <p>The target is not referenced but is an active participant and a response is expected from conversational context.</p>
+    </div>
+    <div class="cat-card cat-silent-1">
+      <div class="cat-id">S1 — SILENT</div>
+      <h4>No Reference</h4>
+      <p>The ongoing exchange involves other speakers and the target remains a bystander with no involvement in the exchange.</p>
+    </div>
+    <div class="cat-card cat-silent-2">
+      <div class="cat-id">S2 — SILENT</div>
+      <h4>Referenced but not Addressed</h4>
+      <p>The target is mentioned (e.g., in third person) but is not expected to respond. Being talked <em>about</em> ≠ being talked <em>to</em>.</p>
+    </div>
+  </div>
+
+</section>
+
+<!-- ══════════════════════════════════════════════
+     CITATION (commented out for now)
+══════════════════════════════════════════════
+<section id="citation">
+  <div class="section-tag">Citation</div>
+  <h2>Citation</h2>
+  <p>If you use this dataset, benchmark, or code in your research, please cite our paper:</p>
+
+  <div class="citation-box" id="bibtex-block">
+    <button class="copy-btn" onclick="copyBibtex()">Copy</button>
+<span class="bibtex-brace">@inproceedings{</span><span class="bibtex-key">bhagtani2026speak</span><span class="bibtex-brace">,</span>
+  <span class="bibtex-field">title</span>     = <span class="bibtex-brace">{</span><span class="bibtex-value">Speak or Stay Silent: Context-Aware Turn-Taking in Multi-Party Dialogue</span><span class="bibtex-brace">},</span>
+  <span class="bibtex-field">author</span>    = <span class="bibtex-brace">{</span><span class="bibtex-value">Bhagtani, Kratika and Anand, Mrinal and Xu, Yu Chen and Yadav, Amit Kumar Singh</span><span class="bibtex-brace">},</span>
+  <span class="bibtex-field">booktitle</span> = <span class="bibtex-brace">{</span><span class="bibtex-value">Proceedings of Interspeech 2026</span><span class="bibtex-brace">},</span>
+  <span class="bibtex-field">year</span>      = <span class="bibtex-brace">{</span><span class="bibtex-value">2026</span><span class="bibtex-brace">},</span>
+  <span class="bibtex-field">url</span>       = <span class="bibtex-brace">{</span><span class="bibtex-value">Add arXiv/paper URL when available</span><span class="bibtex-brace">}</span>
+<span class="bibtex-brace">}</span>
+  </div>
+
+  <script>
+    function copyBibtex() {
+      const text = `@inproceedings{bhagtani2026speak,
+  title     = {Speak or Stay Silent: Context-Aware Turn-Taking in Multi-Party Dialogue},
+  author    = {Bhagtani, Kratika and Anand, Mrinal and Xu, Yu Chen and Yadav, Amit Kumar Singh},
+  booktitle = {Proceedings of Interspeech 2026},
+  year      = {2026},
+  url       = {}
+}`;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+      });
+    }
+  </script>
+</section>
+-->
+
+</main>
+
+</body>
+</html>
