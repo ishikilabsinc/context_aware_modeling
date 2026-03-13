@@ -349,3 +349,18 @@ Inputs and outputs are **not truncated** by default (`--max-length 0`). For reso
 - DDP vs FSDP vs single-GPU: e.g. on a 22GB GPU, a max_length cap around 1536 may be needed for DDP.
 - Batch size and gradient accumulation can be adjusted when using a max length.
 - Training uses the system prompt once; evaluation uses it twice.
+
+---
+
+## Citation
+
+If you use this work, please cite:
+
+```bibtex
+@misc{bhagtani2026speakstaysilentcontextaware,
+  title={Speak or Stay Silent: Context-Aware Turn-Taking in Multi-Party Dialogue},
+  author={Bhagtani, Kratika and Anand, Mrinal and Xu, Yu Chen and Yadav, Amit Kumar Singh},
+  year={2026},
+  url={https://arxiv.org/abs/2603.11409}
+}
+```
