@@ -23,17 +23,10 @@ import re
 from typing import List, Dict, Optional
 from collections import Counter
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+from config import AMI_CORPUS_DIR, JSON_DUMPS_DIR
 
-# Root directory of the AMI corpus relative to this repo.
-# This makes the script robust to moving the repository.
-AMI_CORPUS_DIR = str(Path(__file__).resolve().parents[1] / 'datasets' / 'ami_public_manual_1.6.2')
-
-# Directory for all intermediate JSON dumps across stages
-JSON_DUMPS_DIR = Path(__file__).parent / 'json_dumps'
 JSON_DUMPS_DIR.mkdir(exist_ok=True)
+AMI_CORPUS_DIR = str(AMI_CORPUS_DIR)
 
 OUTPUT_FILE = JSON_DUMPS_DIR / 'stage1_sequences.json'
 

@@ -41,11 +41,8 @@ from pathlib import Path
 from typing import Dict, Tuple
 from collections import Counter
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+from config import JSON_DUMPS_DIR
 
-JSON_DUMPS_DIR = Path('json_dumps')
 INPUT_FILE = JSON_DUMPS_DIR / 'stage2_decision_points.json'
 OUTPUT_FILE = JSON_DUMPS_DIR / 'stage3_categorized_samples.json'
 

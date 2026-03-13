@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import Counter
 
-from config import GEMINI_API_KEY
+from config import GEMINI_API_KEY, AMI_CORPUS_DIR, JSON_DUMPS_DIR
 
 try:
     import google.generativeai as genai
@@ -50,15 +50,8 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 
-
-API_KEY = GEMINI_API_KEY  # Defined in config.py
-
-# Root directory of the AMI corpus relative to this repo.
-# This makes the script robust to moving the repository.
-AMI_CORPUS_DIR = str(Path(__file__).resolve().parents[1] / 'datasets' / 'ami_public_manual_1.6.2')
-
-# Directory for all intermediate JSON dumps across stages
-JSON_DUMPS_DIR = Path(__file__).parent / 'json_dumps'
+API_KEY = GEMINI_API_KEY
+AMI_CORPUS_DIR = str(AMI_CORPUS_DIR)
 JSON_DUMPS_DIR.mkdir(exist_ok=True)
 
 EXPLICIT_SEQUENCES_FILE = JSON_DUMPS_DIR / 'stage1_sequences.json'

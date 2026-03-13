@@ -23,22 +23,16 @@ from pathlib import Path
 from typing import List, Dict, Set
 from collections import Counter, defaultdict
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+from config import (
+    JSON_DUMPS_DIR, JSON_RUN_DIR, OUTPUT_DIR,
+    STAGE4_SPEAK_RATIO, STAGE4_MIN_TEXT_LENGTH, STAGE4_MAX_SAMPLES, STAGE4_MAX_CATEGORY_RATIO,
+)
 
-JSON_DUMPS_DIR = Path('json_dumps')
+JSON_DUMPS_DIR.mkdir(exist_ok=True)
 INPUT_FILE = JSON_DUMPS_DIR / 'stage3_categorized_samples.json'
+OUTPUT_FILE = 'stage4_filtered_samples.jsonl'
 
-# Directory to dump individual filtered samples as separate JSON files
-JSON_RUN_DIR = Path('json_run')
-
-# Directory and filename for aggregated JSONL output
-OUTPUT_DIR = 'data_final'
-OUTPUT_FILE = 'stage4_filtered_samples.jsonl'  # JSONL format
-
-# Target ratio for SPEAK/SILENT
-SPEAK_RATIO = 0.5  # 50% SPEAK, 50% SILENT
+SPEAK_RATIO = STAGE4_SPEAK_RATIO
 
 # Filler words/patterns to remove (case-insensitive)
 FILLER_PATTERNS = [
@@ -53,15 +47,9 @@ FILLER_PATTERNS = [
     r'^\s*\.\s*$',                         # Just punctuation
 ]
 
-# Minimum text length (characters) after cleaning
-MIN_TEXT_LENGTH = 3
-
-# Maximum samples to keep (None = keep all that pass filters)
-MAX_SAMPLES = None  # Can be set to limit dataset size, e.g., 1000000
-
-# Subcategory balance threshold (max ratio any category can be)
-# E.g., 0.4 means no category can be more than 40% of its class
-MAX_CATEGORY_RATIO = 0.35
+MIN_TEXT_LENGTH = STAGE4_MIN_TEXT_LENGTH
+MAX_SAMPLES = STAGE4_MAX_SAMPLES
+MAX_CATEGORY_RATIO = STAGE4_MAX_CATEGORY_RATIO
 
 # ============================================================================
 # CONFIDENCE SCORING

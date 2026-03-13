@@ -25,12 +25,8 @@ from pathlib import Path
 from typing import List, Dict, Set
 from collections import Counter
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+from config import JSON_DUMPS_DIR
 
-# Directory for all intermediate JSON dumps across stages
-JSON_DUMPS_DIR = Path(__file__).parent / 'json_dumps'
 JSON_DUMPS_DIR.mkdir(exist_ok=True)
 
 INPUT_FILE = JSON_DUMPS_DIR / 'stage1_combined_sequences.json'
